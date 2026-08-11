@@ -105,22 +105,6 @@ sum12:
 main:
   addi sp, sp, -16
   sw ra, 12(sp)
-  li t0, 1
-  mv a0, t0
-  li t0, 2
-  mv a1, t0
-  li t0, 3
-  mv a2, t0
-  li t0, 4
-  mv a3, t0
-  li t0, 5
-  mv a4, t0
-  li t0, 6
-  mv a5, t0
-  li t0, 7
-  mv a6, t0
-  li t0, 8
-  mv a7, t0
   li t0, 9
   sw t0, -16(sp)
   li t0, 10
@@ -129,6 +113,14 @@ main:
   sw t0, -8(sp)
   li t0, 12
   sw t0, -4(sp)
+  li a0, 1
+  li a1, 2
+  li a2, 3
+  li a3, 4
+  li a4, 5
+  li a5, 6
+  li a6, 7
+  li a7, 8
   addi sp, sp, -16
   call sum12
   addi sp, sp, 16

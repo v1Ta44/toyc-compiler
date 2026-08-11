@@ -28,8 +28,7 @@ factorial:
   lw t1, 16(sp)
   addi t0, t1, -1
   sw t0, 20(sp)
-  lw t0, 20(sp)
-  mv a0, t0
+  lw a0, 20(sp)
   call factorial
   sw a0, 24(sp)
   lw t1, 12(sp)
@@ -44,8 +43,7 @@ factorial:
 main:
   addi sp, sp, -16
   sw ra, 12(sp)
-  li t0, 5
-  mv a0, t0
+  li a0, 5
   call factorial
   sw a0, 0(sp)
   lw t0, 0(sp)

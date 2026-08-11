@@ -99,9 +99,7 @@ main:
   mv t0, t1
   sw t0, 76(sp)
   lw t1, 76(sp)
-  li t2, 0
-  sub t0, t1, t2
-  seqz t0, t0
+  seqz t0, t1
   sw t0, 80(sp)
   lw t2, 80(sp)
   snez t0, t2

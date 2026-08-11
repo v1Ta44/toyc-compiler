@@ -114,6 +114,14 @@ run_case register_pressure 78 normal
 run_case register_pressure 78 opt
 run_case complex_semantics 1 normal
 run_case complex_semantics 1 opt
+run_case const_expr_chain 1 normal
+run_case const_expr_chain 1 opt
+run_case advanced_matrix 110 normal
+run_case advanced_matrix 110 opt
+run_case basic_combined 124 normal
+run_case basic_combined 124 opt
+run_case optimizer_cfg 23 normal
+run_case optimizer_cfg 23 opt
 run_generated_case codegen_limits 253 normal
 run_generated_case codegen_limits 253 opt
 run_generated_case large_stack 31 normal
@@ -122,10 +130,10 @@ run_generated_case many_arguments 87 normal
 run_generated_case many_arguments 87 opt
 
 # 专用用例中有两组重复的加法和乘法；优化版应各只保留每组的一条指令。
-normal_mul_count="$(grep -c '^  mul ' "${generated_dir}/optimizations.s")"
-opt_mul_count="$(grep -c '^  mul ' "${generated_dir}/optimizations_opt.s")"
-normal_add_count="$(grep -c '^  add ' "${generated_dir}/optimizations.s")"
-opt_add_count="$(grep -c '^  add ' "${generated_dir}/optimizations_opt.s")"
+normal_mul_count="$(grep -c '^  mul ' "${generated_dir}/optimizations.s" || true)"
+opt_mul_count="$(grep -c '^  mul ' "${generated_dir}/optimizations_opt.s" || true)"
+normal_add_count="$(grep -c '^  add ' "${generated_dir}/optimizations.s" || true)"
+opt_add_count="$(grep -c '^  add ' "${generated_dir}/optimizations_opt.s" || true)"
 if (( opt_mul_count >= normal_mul_count || opt_add_count >= normal_add_count )); then
     echo "FAIL optimization shape: add ${normal_add_count}->${opt_add_count}, mul ${normal_mul_count}->${opt_mul_count}" >&2
     exit 1
@@ -133,7 +141,8 @@ fi
 echo "PASS optimization shape: add ${normal_add_count}->${opt_add_count}, mul ${normal_mul_count}->${opt_mul_count}"
 
 # 核心用例的优化版必须减少静态指令数；控制流热路径还要求显著降低访存和搬运。
-for case_name in recursion control_flow optimizations register_pressure complex_semantics; do
+for case_name in recursion control_flow optimizations register_pressure complex_semantics \
+                 advanced_matrix basic_combined optimizer_cfg; do
     normal_instruction_count="$(grep -c '^  ' "${generated_dir}/${case_name}.s")"
     opt_instruction_count="$(grep -c '^  ' "${generated_dir}/${case_name}_opt.s")"
     if (( opt_instruction_count >= normal_instruction_count )); then

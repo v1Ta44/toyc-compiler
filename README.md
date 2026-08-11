@@ -56,11 +56,12 @@ PASS control_flow_opt: exit=1
 ```
 
 `-opt` enables local-slot promotion, versioned common-subexpression elimination,
-algebraic simplification, CFG reachability pruning, dead-code and move removal,
-and per-function call-aware register allocation. Short-lived values prefer
-`t4`-`t6`; values live across calls use `s1`-`s11`, and only excess values spill.
-Leaf functions avoid unnecessary frames and `ra` saves. Constant expressions
-are folded during lowering in both modes.
+CFG fixed-point constant propagation, liveness-based dead-definition removal,
+control-flow cleanup, compare/branch fusion, strength reduction, and per-function
+call-aware register allocation. Short-lived values can use `t4`-`t6` and free
+`a0`-`a7`; values live across calls use `s1`-`s11`, and only excess values spill.
+Call arguments are rearranged with cycle-safe parallel copies. Constant folding
+uses explicit RV32 signed 32-bit wraparound semantics in both modes.
 
 The output uses the RV32I/M integer instruction set. Calls use `a0`-`a7` for
 the first eight integer arguments and stack-passed arguments thereafter.

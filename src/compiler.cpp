@@ -1,6 +1,10 @@
 #include "compiler.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdint>
+#include <iterator>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -64,6 +68,14 @@ class Generator {
 
     static bool isVirtual(const std::string &value) {
         return !value.empty() && (value[0] == 't' || value[0] == '@');
+    }
+
+    static int fromBits(std::uint32_t value) {
+        return static_cast<int>(std::bit_cast<std::int32_t>(value));
+    }
+
+    static int wrapNeg(int value) {
+        return fromBits(0U - static_cast<std::uint32_t>(value));
     }
 
     static std::unordered_map<std::string, int> immediateConstants(const std::vector<IR> &code) {
@@ -287,6 +299,282 @@ class Generator {
         ir_ = std::move(compact);
     }
 
+    // 在每个函数的 CFG 上求“所有前驱均相同”的常量事实，避免跨分支和循环误传播。
+    void propagateConstants() {
+        std::vector<IR> result;
+        for (size_t begin = 0; begin < ir_.size();) {
+            size_t end = begin + 1;
+            while (end < ir_.size() &&
+                   !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
+                ++end;
+            std::vector<IR> code(ir_.begin() + begin, ir_.begin() + end);
+            const size_t count = code.size();
+            std::unordered_map<std::string, size_t> labels;
+            for (size_t i = 0; i < count; ++i)
+                if (code[i].op == IR::Label)
+                    labels[code[i].x] = i;
+
+            std::vector<std::vector<size_t>> predecessors(count);
+            for (size_t i = 0; i < count; ++i) {
+                auto addEdge = [&](size_t target) {
+                    if (target < count)
+                        predecessors[target].push_back(i);
+                };
+                if (code[i].op == IR::Jump) {
+                    if (auto target = labels.find(code[i].x); target != labels.end())
+                        addEdge(target->second);
+                } else if (code[i].op == IR::BrZ) {
+                    if (auto target = labels.find(code[i].y); target != labels.end())
+                        addEdge(target->second);
+                    addEdge(i + 1);
+                } else if (code[i].op != IR::Ret) {
+                    addEdge(i + 1);
+                }
+            }
+
+            using Facts = std::unordered_map<std::string, int>;
+            std::vector<Facts> in(count), out(count);
+            std::vector<bool> reachable(count);
+            if (count)
+                reachable[0] = true;
+            auto lookup = [](const Facts &facts, const std::string &value) -> std::optional<int> {
+                if (value == "0")
+                    return 0;
+                if (auto found = facts.find(value); found != facts.end())
+                    return found->second;
+                return std::nullopt;
+            };
+            auto transfer = [&](const IR &ins, Facts facts) {
+                auto forget = [&](const std::string &value) {
+                    if (isVirtual(value))
+                        facts.erase(value);
+                };
+                if (ins.op == IR::Mov) {
+                    const auto source =
+                        ins.y.empty() ? std::optional<int>{ins.imm} : lookup(facts, ins.y);
+                    forget(ins.x);
+                    if (isVirtual(ins.x) && source)
+                        facts[ins.x] = *source;
+                } else if (ins.op == IR::Bin) {
+                    const auto left = lookup(facts, ins.y);
+                    const auto right = lookup(facts, ins.z);
+                    forget(ins.x);
+                    if (isVirtual(ins.x) && left && right &&
+                        !((ins.aux == "/" || ins.aux == "%") && *right == 0))
+                        facts[ins.x] = calc(ins.aux, *left, *right);
+                } else if (ins.op == IR::Load || ins.op == IR::Call) {
+                    forget(ins.x);
+                } else if (ins.op == IR::Store && isVirtual(ins.x)) {
+                    const auto source = lookup(facts, ins.y);
+                    forget(ins.x);
+                    if (source)
+                        facts[ins.x] = *source;
+                }
+                return facts;
+            };
+
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (size_t i = 0; i < count; ++i) {
+                    bool nowReachable = i == 0;
+                    Facts merged;
+                    bool havePredecessor = false;
+                    for (size_t pred : predecessors[i]) {
+                        if (!reachable[pred])
+                            continue;
+                        nowReachable = true;
+                        if (!havePredecessor) {
+                            merged = out[pred];
+                            havePredecessor = true;
+                        } else {
+                            for (auto it = merged.begin(); it != merged.end();) {
+                                auto other = out[pred].find(it->first);
+                                if (other == out[pred].end() || other->second != it->second)
+                                    it = merged.erase(it);
+                                else
+                                    ++it;
+                            }
+                        }
+                    }
+                    if (!nowReachable)
+                        continue;
+                    Facts next = transfer(code[i], merged);
+                    if (!reachable[i] || in[i] != merged || out[i] != next) {
+                        reachable[i] = true;
+                        in[i] = std::move(merged);
+                        out[i] = std::move(next);
+                        changed = true;
+                    }
+                }
+            }
+
+            std::unordered_map<int, std::string> materialized;
+            std::vector<IR> prefix;
+            auto constantValue = [&](const Facts &facts, const std::string &value) {
+                return lookup(facts, value);
+            };
+            auto constantTemp = [&](int value) {
+                if (auto found = materialized.find(value); found != materialized.end())
+                    return found->second;
+                std::string name = tmp();
+                materialized[value] = name;
+                prefix.emplace_back(IR::Mov, name, std::string{}, std::string{}, std::string{},
+                                    value);
+                return name;
+            };
+            std::vector<IR> rewritten;
+            for (size_t i = 0; i < count; ++i) {
+                IR ins = code[i];
+                const Facts &facts = in[i];
+                auto replace = [&](std::string &operand) {
+                    if (auto value = constantValue(facts, operand))
+                        operand = constantTemp(*value);
+                };
+                if (ins.op == IR::Mov && !ins.y.empty()) {
+                    if (auto value = constantValue(facts, ins.y)) {
+                        ins.y.clear();
+                        ins.imm = *value;
+                    }
+                } else if (ins.op == IR::Bin) {
+                    const auto left = constantValue(facts, ins.y);
+                    const auto right = constantValue(facts, ins.z);
+                    if (left && right && !((ins.aux == "/" || ins.aux == "%") && *right == 0)) {
+                        ins.op = IR::Mov;
+                        ins.y.clear();
+                        ins.z.clear();
+                        ins.imm = calc(ins.aux, *left, *right);
+                        ins.aux.clear();
+                    } else {
+                        replace(ins.y);
+                        replace(ins.z);
+                    }
+                } else if (ins.op == IR::Store) {
+                    replace(ins.y);
+                } else if (ins.op == IR::Call) {
+                    auto args = callArgs(ins.y);
+                    for (auto &arg : args)
+                        replace(arg);
+                    ins.y = joinArgs(args);
+                } else if (ins.op == IR::BrZ) {
+                    if (auto value = constantValue(facts, ins.x)) {
+                        if (*value == 0)
+                            rewritten.emplace_back(IR::Jump, ins.y);
+                        continue;
+                    }
+                }
+                rewritten.push_back(std::move(ins));
+            }
+            if (!rewritten.empty()) {
+                result.push_back(std::move(rewritten.front()));
+                result.insert(result.end(), std::make_move_iterator(prefix.begin()),
+                              std::make_move_iterator(prefix.end()));
+                result.insert(result.end(), std::make_move_iterator(rewritten.begin() + 1),
+                              std::make_move_iterator(rewritten.end()));
+            }
+            begin = end;
+        }
+        ir_ = std::move(result);
+    }
+
+    // 基于 CFG 活跃性删除被覆盖或从未读取的纯定义，包括提升后的局部变量写入。
+    void eliminateDeadDefinitions() {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            std::vector<IR> result;
+            for (size_t begin = 0; begin < ir_.size();) {
+                size_t end = begin + 1;
+                while (end < ir_.size() &&
+                       !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
+                    ++end;
+                std::vector<IR> code(ir_.begin() + begin, ir_.begin() + end);
+                const size_t count = code.size();
+                std::unordered_map<std::string, size_t> labels;
+                for (size_t i = 0; i < count; ++i)
+                    if (code[i].op == IR::Label)
+                        labels[code[i].x] = i;
+                std::vector<std::unordered_set<std::string>> uses(count), defs(count),
+                    liveIn(count), liveOut(count);
+                auto use = [&](size_t i, const std::string &value) {
+                    if (isVirtual(value))
+                        uses[i].insert(value);
+                };
+                auto define = [&](size_t i, const std::string &value) {
+                    if (isVirtual(value))
+                        defs[i].insert(value);
+                };
+                for (size_t i = 0; i < count; ++i) {
+                    const auto &ins = code[i];
+                    if (ins.op == IR::Mov) {
+                        define(i, ins.x);
+                        use(i, ins.y);
+                    } else if (ins.op == IR::Bin) {
+                        define(i, ins.x);
+                        use(i, ins.y);
+                        use(i, ins.z);
+                    } else if (ins.op == IR::Load) {
+                        define(i, ins.x);
+                        use(i, ins.y);
+                    } else if (ins.op == IR::Store) {
+                        define(i, ins.x);
+                        use(i, ins.y);
+                    } else if (ins.op == IR::Call) {
+                        define(i, ins.x);
+                        for (const auto &arg : callArgs(ins.y))
+                            use(i, arg);
+                    } else if (ins.op == IR::BrZ) {
+                        use(i, ins.x);
+                    }
+                }
+                bool liveChanged = true;
+                while (liveChanged) {
+                    liveChanged = false;
+                    for (size_t reverse = count; reverse-- > 0;) {
+                        std::unordered_set<std::string> out;
+                        auto merge = [&](size_t successor) {
+                            if (successor < count)
+                                out.insert(liveIn[successor].begin(), liveIn[successor].end());
+                        };
+                        const auto &ins = code[reverse];
+                        if (ins.op == IR::Jump) {
+                            if (auto target = labels.find(ins.x); target != labels.end())
+                                merge(target->second);
+                        } else if (ins.op == IR::BrZ) {
+                            if (auto target = labels.find(ins.y); target != labels.end())
+                                merge(target->second);
+                            merge(reverse + 1);
+                        } else if (ins.op != IR::Ret) {
+                            merge(reverse + 1);
+                        }
+                        auto inSet = uses[reverse];
+                        for (const auto &value : out)
+                            if (!defs[reverse].contains(value))
+                                inSet.insert(value);
+                        if (out != liveOut[reverse] || inSet != liveIn[reverse]) {
+                            liveOut[reverse] = std::move(out);
+                            liveIn[reverse] = std::move(inSet);
+                            liveChanged = true;
+                        }
+                    }
+                }
+                for (size_t i = 0; i < count; ++i) {
+                    const auto &ins = code[i];
+                    const bool pure = ins.op == IR::Mov || ins.op == IR::Bin ||
+                                      ins.op == IR::Load ||
+                                      (ins.op == IR::Store && isVirtual(ins.x));
+                    if (pure && isVirtual(ins.x) && !liveOut[i].contains(ins.x)) {
+                        changed = true;
+                        continue;
+                    }
+                    result.push_back(ins);
+                }
+                begin = end;
+            }
+            ir_ = std::move(result);
+        }
+    }
+
     // 基本块内局部值编号：同时复用未失效的 Load 和二元表达式。
     void eliminateCommonSubexpressions() {
         std::vector<IR> result;
@@ -482,6 +770,7 @@ class Generator {
             int end;
         };
         std::unordered_map<std::string, std::pair<int, int>> ranges;
+        std::unordered_map<std::string, std::string> incomingRegisters;
         auto touch = [&](const std::string &value, int position) {
             if (!isVirtual(value) || constants.contains(value))
                 return;
@@ -494,6 +783,9 @@ class Generator {
             if (ins.op == IR::Mov) {
                 touch(ins.x, position);
                 touch(ins.y, position);
+                if (isVirtual(ins.x) && ins.y.size() == 2 && ins.y[0] == 'a' && ins.y[1] >= '0' &&
+                    ins.y[1] <= '7')
+                    incomingRegisters[ins.x] = ins.y;
             } else if (ins.op == IR::Bin) {
                 touch(ins.x, position);
                 touch(ins.y, position);
@@ -515,7 +807,8 @@ class Generator {
         std::sort(intervals.begin(), intervals.end(),
                   [](const auto &a, const auto &b) { return a.begin < b.begin; });
 
-        const std::array<std::string, 3> temporaries = {"t4", "t5", "t6"};
+        const std::array<std::string, 11> temporaries = {"t4", "t5", "t6", "a0", "a1", "a2",
+                                                         "a3", "a4", "a5", "a6", "a7"};
         const std::array<std::string, 11> saved = {"s1", "s2", "s3", "s4",  "s5", "s6",
                                                    "s7", "s8", "s9", "s10", "s11"};
         struct Active {
@@ -538,7 +831,12 @@ class Generator {
             }
             const bool crossesCall = liveAcrossCalls.contains(interval.value);
             std::string reg;
-            if (!crossesCall)
+            if (!crossesCall) {
+                if (auto incoming = incomingRegisters.find(interval.value);
+                    incoming != incomingRegisters.end() && free.contains(incoming->second))
+                    reg = incoming->second;
+            }
+            if (!crossesCall && reg.empty())
                 for (const auto &candidate : temporaries)
                     if (free.contains(candidate)) {
                         reg = candidate;
@@ -583,15 +881,21 @@ class Generator {
     // 编译期计算纯常量二元表达式，是常量折叠和 const 初始化检查的基础。
     static int calc(const std::string &o, int a, int b) {
         if (o == "+")
-            return a + b;
+            return fromBits(static_cast<std::uint32_t>(a) + static_cast<std::uint32_t>(b));
         if (o == "-")
-            return a - b;
+            return fromBits(static_cast<std::uint32_t>(a) - static_cast<std::uint32_t>(b));
         if (o == "*")
-            return a * b;
-        if (o == "/")
+            return fromBits(static_cast<std::uint32_t>(a) * static_cast<std::uint32_t>(b));
+        if (o == "/") {
+            if (a == std::numeric_limits<std::int32_t>::min() && b == -1)
+                return a;
             return a / b;
-        if (o == "%")
+        }
+        if (o == "%") {
+            if (a == std::numeric_limits<std::int32_t>::min() && b == -1)
+                return 0;
             return a % b;
+        }
         if (o == "<")
             return a < b;
         if (o == ">")
@@ -604,9 +908,15 @@ class Generator {
             return a == b;
         if (o == "!=")
             return a != b;
+        if (o == "!")
+            return !b;
+        if (o == "bool")
+            return !!b;
         if (o == "&&")
             return !!a && !!b;
-        return !!a || !!b;
+        if (o == "||")
+            return !!a || !!b;
+        throw std::runtime_error("unknown constant operator: " + o);
     }
 
     // 将一个表达式降低为 IR，并返回常量值或承载结果的虚拟临时量。
@@ -644,7 +954,7 @@ class Generator {
             // 常量一元运算直接折叠；运行期运算复用 Bin 指令表示。
             if (a.constant) {
                 if (e->op == "-")
-                    a.n = -a.n;
+                    a.n = wrapNeg(a.n);
                 else if (e->op == "!")
                     a.n = !a.n;
                 return a;
@@ -842,10 +1152,14 @@ class Generator {
             eliminateCommonSubexpressions();
             simplifyIR();
             simplifyControlFlow();
+            propagateConstants();
+            simplifyControlFlow();
             eliminateCommonSubexpressions();
             simplifyIR();
+            eliminateDeadDefinitions();
             coalesceAdjacentMoves();
             simplifyIR();
+            eliminateDeadDefinitions();
         }
     }
 
@@ -869,12 +1183,6 @@ class Generator {
                                    : std::unordered_map<std::string, std::string>{};
             const bool hasCall = std::any_of(code.begin(), code.end(),
                                              [](const IR &ins) { return ins.op == IR::Call; });
-            if (opt_ && !hasCall)
-                for (const auto &ins : code)
-                    if (ins.op == IR::Mov && !ins.x.empty() && ins.x[0] == '@' &&
-                        ins.y.size() == 2 && ins.y[0] == 'a' && ins.y[1] >= '0' && ins.y[1] <= '7')
-                        allocation[ins.x] = ins.y;
-
             std::unordered_set<std::string> savedSet;
             for (const auto &[value, reg] : allocation)
                 if (!reg.empty() && reg[0] == 's')
@@ -984,8 +1292,53 @@ class Generator {
                 o << "  ret\n";
             };
 
+            std::unordered_map<std::string, int> valueUses;
+            auto countUse = [&](const std::string &value) {
+                if (isVirtual(value))
+                    ++valueUses[value];
+            };
+            for (const auto &candidate : code) {
+                if (candidate.op == IR::Mov)
+                    countUse(candidate.y);
+                else if (candidate.op == IR::Bin) {
+                    countUse(candidate.y);
+                    countUse(candidate.z);
+                } else if (candidate.op == IR::Load)
+                    countUse(candidate.y);
+                else if (candidate.op == IR::Store)
+                    countUse(candidate.y);
+                else if (candidate.op == IR::Call)
+                    for (const auto &arg : callArgs(candidate.y))
+                        countUse(arg);
+                else if (candidate.op == IR::BrZ)
+                    countUse(candidate.x);
+            }
+
             for (size_t position = 0; position < code.size(); ++position) {
                 const auto &ins = code[position];
+                if (opt_ && ins.op == IR::Bin && position + 1 < code.size() &&
+                    code[position + 1].op == IR::BrZ && code[position + 1].x == ins.x &&
+                    valueUses[ins.x] == 1) {
+                    const std::string &targetLabel = code[position + 1].y;
+                    if (ins.aux == "bool" || ins.aux == "!") {
+                        const auto value = reg(ins.z, "t1");
+                        o << "  " << (ins.aux == "bool" ? "beqz" : "bnez") << " " << value << ", "
+                          << targetLabel << "\n";
+                        ++position;
+                        continue;
+                    }
+                    const std::unordered_map<std::string, std::string> inverseBranch = {
+                        {"<", "bge"},  {">", "ble"},  {"<=", "bgt"},
+                        {">=", "blt"}, {"==", "bne"}, {"!=", "beq"}};
+                    if (auto branch = inverseBranch.find(ins.aux); branch != inverseBranch.end()) {
+                        const auto left = reg(ins.y, "t1");
+                        const auto right = reg(ins.z, "t2");
+                        o << "  " << branch->second << " " << left << ", " << right << ", "
+                          << targetLabel << "\n";
+                        ++position;
+                        continue;
+                    }
+                }
                 switch (ins.op) {
                 case IR::Label:
                     o << ins.x << ":\n";
@@ -1031,14 +1384,64 @@ class Generator {
                         const auto left = reg(ins.y, "t1");
                         o << "  addi " << target << ", " << left << ", " << -*rightImm << "\n";
                         emitted = true;
+                    } else if ((ins.aux == "==" || ins.aux == "!=") &&
+                               ((leftImm && *leftImm == 0) || (rightImm && *rightImm == 0))) {
+                        const auto value = reg(leftImm ? ins.z : ins.y, "t1");
+                        o << "  " << (ins.aux == "==" ? "seqz" : "snez") << " " << target << ", "
+                          << value << "\n";
+                        emitted = true;
+                    } else if (ins.aux == "<" && rightImm && *rightImm >= -2048 &&
+                               *rightImm <= 2047) {
+                        const auto left = reg(ins.y, "t1");
+                        o << "  slti " << target << ", " << left << ", " << *rightImm << "\n";
+                        emitted = true;
                     } else if (ins.aux == "*" && (leftImm || rightImm)) {
                         const int factor = leftImm ? *leftImm : *rightImm;
-                        if (factor > 0 && (factor & (factor - 1)) == 0) {
+                        const auto source = reg(leftImm ? ins.z : ins.y, "t1");
+                        const std::uint32_t magnitude =
+                            factor < 0 ? 0U - static_cast<std::uint32_t>(factor)
+                                       : static_cast<std::uint32_t>(factor);
+                        if (magnitude && (magnitude & (magnitude - 1)) == 0) {
                             int shift = 0;
-                            for (int value = factor; value > 1; value >>= 1)
+                            for (std::uint32_t value = magnitude; value > 1; value >>= 1)
                                 ++shift;
-                            const auto source = reg(leftImm ? ins.z : ins.y, "t1");
                             o << "  slli " << target << ", " << source << ", " << shift << "\n";
+                            if (factor < 0)
+                                o << "  neg " << target << ", " << target << "\n";
+                            emitted = true;
+                        } else if (magnitude == 3 || magnitude == 5 || magnitude == 7 ||
+                                   magnitude == 9) {
+                            const int shift = magnitude == 3 ? 1 : magnitude == 5 ? 2 : 3;
+                            o << "  slli t2, " << source << ", " << shift << "\n  "
+                              << (magnitude == 7 ? "sub " : "add ") << target << ", "
+                              << (magnitude == 7 ? "t2, " + source : source + ", t2") << "\n";
+                            if (factor < 0)
+                                o << "  neg " << target << ", " << target << "\n";
+                            emitted = true;
+                        }
+                    } else if ((ins.aux == "/" || ins.aux == "%") && rightImm && *rightImm != 0) {
+                        const int divisor = *rightImm;
+                        const std::uint32_t magnitude =
+                            divisor < 0 ? 0U - static_cast<std::uint32_t>(divisor)
+                                        : static_cast<std::uint32_t>(divisor);
+                        if (magnitude > 1 && (magnitude & (magnitude - 1)) == 0) {
+                            int shift = 0;
+                            for (std::uint32_t value = magnitude; value > 1; value >>= 1)
+                                ++shift;
+                            const auto source = reg(ins.y, "t1");
+                            o << "  srai t2, " << source << ", 31\n"
+                              << "  srli t2, t2, " << (32 - shift) << "\n"
+                              << "  add t2, " << source << ", t2\n"
+                              << "  srai t2, t2, " << shift << "\n";
+                            if (ins.aux == "/") {
+                                if (divisor < 0)
+                                    o << "  neg " << target << ", t2\n";
+                                else if (target != "t2")
+                                    o << "  mv " << target << ", t2\n";
+                            } else {
+                                o << "  slli t2, t2, " << shift << "\n"
+                                  << "  sub " << target << ", " << source << ", t2\n";
+                            }
                             emitted = true;
                         }
                     }
@@ -1080,13 +1483,67 @@ class Generator {
                     const auto args = callArgs(ins.y);
                     const int extra =
                         args.size() > 8 ? ((static_cast<int>(args.size() - 8) * 4 + 15) & ~15) : 0;
-                    for (size_t k = 0; k < args.size(); ++k) {
+                    // 栈上传递的参数先写出，避免随后重排 a0-a7 时覆盖它们的源寄存器。
+                    for (size_t k = 8; k < args.size(); ++k) {
                         const auto source = reg(args[k], "t0");
-                        if (k < 8) {
-                            if (source != "a" + std::to_string(k))
-                                o << "  mv a" << k << ", " << source << "\n";
-                        } else
-                            stackMemory("sw", source, -extra + static_cast<int>(k - 8) * 4);
+                        stackMemory("sw", source, -extra + static_cast<int>(k - 8) * 4);
+                    }
+
+                    struct RegisterMove {
+                        std::string target;
+                        std::string source;
+                    };
+                    std::vector<RegisterMove> moves;
+                    struct DeferredArgument {
+                        std::string target;
+                        std::string value;
+                    };
+                    std::vector<DeferredArgument> deferred;
+                    for (size_t k = 0; k < std::min<size_t>(8, args.size()); ++k) {
+                        const std::string target = "a" + std::to_string(k);
+                        if (constant(args[k])) {
+                            deferred.push_back({target, args[k]});
+                        } else if (auto found = allocation.find(args[k]);
+                                   found != allocation.end()) {
+                            if (found->second != target)
+                                moves.push_back({target, found->second});
+                        } else if (isVirtual(args[k])) {
+                            deferred.push_back({target, args[k]});
+                        } else if (args[k] != target) {
+                            moves.push_back({target, args[k]});
+                        }
+                    }
+
+                    // 按并行拷贝语义重排参数寄存器；环用保留的 t3 临时打破。
+                    while (!moves.empty()) {
+                        auto ready = moves.end();
+                        for (auto candidate = moves.begin(); candidate != moves.end();
+                             ++candidate) {
+                            const bool targetIsSource =
+                                std::any_of(moves.begin(), moves.end(), [&](const auto &move) {
+                                    return move.source == candidate->target;
+                                });
+                            if (!targetIsSource) {
+                                ready = candidate;
+                                break;
+                            }
+                        }
+                        if (ready == moves.end()) {
+                            const std::string savedTarget = moves.front().target;
+                            o << "  mv t3, " << savedTarget << "\n";
+                            for (auto &move : moves)
+                                if (move.source == savedTarget)
+                                    move.source = "t3";
+                            continue;
+                        }
+                        o << "  mv " << ready->target << ", " << ready->source << "\n";
+                        moves.erase(ready);
+                    }
+                    for (const auto &argument : deferred) {
+                        if (auto imm = constant(argument.value))
+                            o << "  li " << argument.target << ", " << *imm << "\n";
+                        else
+                            stackMemory("lw", argument.target, slot[argument.value] * 4);
                     }
                     adjustStack(-extra);
                     o << "  call " << ins.aux << "\n";

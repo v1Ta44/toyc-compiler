@@ -1,0 +1,29 @@
+int total = 0;
+
+int sink(int a, int b, int c, int d, int e, int f, int g, int h) {
+  return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8;
+}
+
+int reverse_forward(int a, int b, int c, int d, int e, int f, int g, int h) {
+  return sink(h, g, f, e, d, c, b, a);
+}
+
+int mark(int value) {
+  total = total + value;
+  return value;
+}
+
+int main() {
+  int index = 0;
+  while (index < 4) {
+    if (index == 2) {
+      index = index + 1;
+      continue;
+    }
+    total = total + index;
+    index = index + 1;
+  }
+  0 && mark(100);
+  1 || mark(100);
+  return total + reverse_forward(1, 2, 3, 4, 5, 6, 7, 8);
+}

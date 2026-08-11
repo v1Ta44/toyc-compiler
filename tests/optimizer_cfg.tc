@@ -1,0 +1,24 @@
+int choose(int condition) {
+  int value = 10;
+  if (condition) {
+    value = 20;
+  } else {
+    value = 30;
+  }
+  return value;
+}
+
+int main() {
+  int index = 0;
+  int accumulated = 1;
+  while (index < 5) {
+    accumulated = accumulated + index;
+    index = index + 1;
+  }
+  int quotient = -33 / 8;
+  int remainder = -33 % 8;
+  int negative_divisor = 33 / -8;
+  int zero = 0;
+  int inverted = !zero;
+  return accumulated + choose(index == 5) + quotient + remainder + negative_divisor + inverted;
+}

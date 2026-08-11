@@ -116,8 +116,7 @@ main:
   lw t1, 108(sp)
   mv t0, t1
   sw t0, 124(sp)
-  lw t0, 124(sp)
-  mv a0, t0
+  lw a0, 124(sp)
   call identity
   sw a0, 128(sp)
   lw t1, 120(sp)

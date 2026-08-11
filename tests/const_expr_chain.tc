@@ -1,0 +1,11 @@
+const int maximum = 2147483647;
+const int wrapped = maximum + 1;
+const int divided = wrapped / -1;
+const int remainder = wrapped % -1;
+const int negated = -wrapped;
+const int mixed = (wrapped + 7) * 3 - 21;
+
+int main() {
+  return wrapped == -2147483647 - 1 && divided == wrapped && remainder == 0 &&
+         negated == wrapped && mixed == wrapped;
+}

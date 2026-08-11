@@ -15,8 +15,7 @@ main:
   mv t0, t1
   sw t0, 8(sp)
   lw t1, 8(sp)
-  li t2, 10
-  slt t0, t1, t2
+  slti t0, t1, 10
   sw t0, 12(sp)
   lw t0, 12(sp)
   beqz t0, .L5
@@ -32,13 +31,15 @@ main:
   mv t0, t1
   sw t0, 24(sp)
   lw t1, 24(sp)
-  li t2, 2
-  rem t0, t1, t2
+  srai t2, t1, 31
+  srli t2, t2, 31
+  add t2, t1, t2
+  srai t2, t2, 1
+  slli t2, t2, 1
+  sub t0, t1, t2
   sw t0, 28(sp)
   lw t1, 28(sp)
-  li t2, 0
-  sub t0, t1, t2
-  seqz t0, t0
+  seqz t0, t1
   sw t0, 32(sp)
   lw t0, 32(sp)
   beqz t0, .L17
