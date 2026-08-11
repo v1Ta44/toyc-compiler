@@ -126,6 +126,10 @@ run_case loop_optimizations 1 normal
 run_case loop_optimizations 1 opt
 run_case global_effects 75 normal
 run_case global_effects 75 opt
+run_case strength_reduction 1 normal
+run_case strength_reduction 1 opt
+run_case constant_division 1 normal
+run_case constant_division 1 opt
 run_generated_case codegen_limits 253 normal
 run_generated_case codegen_limits 253 opt
 run_generated_case large_stack 31 normal
@@ -146,7 +150,8 @@ echo "PASS optimization shape: add ${normal_add_count}->${opt_add_count}, mul ${
 
 # 核心用例的优化版必须减少静态指令数；控制流热路径还要求显著降低访存和搬运。
 for case_name in recursion control_flow optimizations register_pressure complex_semantics \
-                 advanced_matrix basic_combined optimizer_cfg loop_optimizations global_effects; do
+                 advanced_matrix basic_combined optimizer_cfg loop_optimizations global_effects \
+                 strength_reduction constant_division; do
     normal_instruction_count="$(grep -c '^  ' "${generated_dir}/${case_name}.s")"
     opt_instruction_count="$(grep -c '^  ' "${generated_dir}/${case_name}_opt.s")"
     if (( opt_instruction_count >= normal_instruction_count )); then
@@ -172,7 +177,8 @@ loop_start="$((kernel_start + loop_start - 1))"
 loop_end="$(tail -n "+${kernel_start}" "${loop_assembly}" | grep -n '^\.L' | sed -n '2p' | cut -d: -f1)"
 loop_end="$((kernel_start + loop_end - 1))"
 mul_line="$(grep -n '^  mul ' "${loop_assembly}" | cut -d: -f1)"
-div_line="$(grep -n '^  div ' "${loop_assembly}" | cut -d: -f1)"
+div_line="$(grep -n '^  div ' "${loop_assembly}" | cut -d: -f1 || true)"
+div_line="${div_line:-0}"
 hot_global_accesses="$(sed -n "${loop_start},${loop_end}p" "${loop_assembly}" | \
     grep -Ec '^  (la|lw|sw) ' || true)"
 opt_loop_instructions="$(sed -n "${loop_start},${loop_end}p" "${loop_assembly}" | \
@@ -193,3 +199,70 @@ if (( mul_line >= loop_start || div_line >= loop_start || hot_global_accesses !=
     exit 1
 fi
 echo "PASS loop optimization shape: body ${normal_loop_instructions}->${opt_loop_instructions}, invariant mul/div hoisted, hot global memory=${hot_global_accesses}"
+
+# 线性归纳变量乘法只允许在循环前初始化一次，热循环体内必须用加法更新累加器。
+strength_assembly="${generated_dir}/strength_reduction_opt.s"
+strength_loop_start="$(grep -n -m1 '^\.L' "${strength_assembly}" | cut -d: -f1)"
+strength_mul_lines="$(grep -n '^  mul ' "${strength_assembly}" | cut -d: -f1)"
+strength_mul_count="$(grep -c '^  mul ' "${strength_assembly}" || true)"
+strength_hot_mul_count="$(echo "${strength_mul_lines}" | awk -v loop="${strength_loop_start}" '$1 >= loop { ++count } END { print count + 0 }')"
+if (( strength_mul_count != 1 || strength_hot_mul_count != 0 )); then
+    echo "FAIL induction strength reduction: loop=${strength_loop_start}, mul=${strength_mul_lines}" >&2
+    exit 1
+fi
+echo "PASS induction strength reduction: initialization mul before loop ${strength_loop_start}"
+
+constant_division_assembly="${generated_dir}/constant_division_opt.s"
+constant_divrem_count="$(grep -Ec '^  (div|rem) ' "${constant_division_assembly}" || true)"
+constant_mulh_count="$(grep -c '^  mulh ' "${constant_division_assembly}" || true)"
+if (( constant_divrem_count != 0 || constant_mulh_count == 0 )); then
+    echo "FAIL constant division lowering: div/rem=${constant_divrem_count}, mulh=${constant_mulh_count}" >&2
+    exit 1
+fi
+echo "PASS constant division lowering: div/rem=${constant_divrem_count}, mulh=${constant_mulh_count}"
+
+# 记录机器码静态数量和 QEMU 动态执行指标，并以 GCC RV32 -O2/-O3 作为成熟后端参照。
+metrics_file="${generated_dir}/backend_metrics.csv"
+printf '%s\n' 'variant,static_instructions,dynamic_instructions,estimated_cycles,mul,div_rem,lw,sw,stack_lw,stack_sw,callee_saves,callee_restores,calls,branches' \
+    > "${metrics_file}"
+
+collect_metrics() {
+    local variant="$1"
+    local binary="$2"
+    local trace="${binary_dir}/${variant}.trace"
+    local static_count
+    local dynamic_metrics
+    static_count="$(riscv64-linux-gnu-objdump -d "${binary}" | \
+        grep -Ec '^[[:space:]]+[[:xdigit:]]+:')"
+    set +e
+    qemu-riscv32 -d in_asm,exec,nochain -D "${trace}" "${binary}"
+    set -e
+    dynamic_metrics="$(awk -f "${repo_dir}/tests/trace_metrics.awk" "${trace}")"
+    printf '%s,%s,%s\n' "${variant}" "${static_count}" "${dynamic_metrics}" >> "${metrics_file}"
+}
+
+for case_name in recursion control_flow optimizations register_pressure complex_semantics \
+                 advanced_matrix basic_combined optimizer_cfg loop_optimizations global_effects \
+                 strength_reduction constant_division; do
+    collect_metrics "${case_name}_normal" "${binary_dir}/${case_name}"
+    collect_metrics "${case_name}_opt" "${binary_dir}/${case_name}_opt"
+done
+
+for level in O2 O3; do
+    gcc_object="${binary_dir}/loop_optimizations_gcc_${level}.o"
+    gcc_binary="${binary_dir}/loop_optimizations_gcc_${level}"
+    riscv64-linux-gnu-gcc -march=rv32im -mabi=ilp32 -ffreestanding -fno-builtin -fwrapv \
+        "-${level}" -x c -c "${repo_dir}/tests/loop_optimizations.tc" -o "${gcc_object}"
+    riscv64-linux-gnu-gcc -march=rv32im -mabi=ilp32 -nostdlib -static -Wl,-e,_start \
+        "${repo_dir}/tests/rv32_start.s" "${gcc_object}" -o "${gcc_binary}"
+    collect_metrics "gcc_${level}" "${gcc_binary}"
+done
+
+normal_dynamic="$(awk -F, '$1 == "loop_optimizations_normal" { print $3 }' "${metrics_file}")"
+opt_dynamic="$(awk -F, '$1 == "loop_optimizations_opt" { print $3 }' "${metrics_file}")"
+if (( opt_dynamic >= normal_dynamic )); then
+    echo "FAIL dynamic instruction count loop_optimizations: ${normal_dynamic}->${opt_dynamic}" >&2
+    exit 1
+fi
+echo "PASS dynamic instruction count loop_optimizations: ${normal_dynamic}->${opt_dynamic}"
+echo "PASS backend metrics recorded: ${metrics_file}"

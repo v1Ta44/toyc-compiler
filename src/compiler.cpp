@@ -3,8 +3,10 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -33,6 +35,187 @@ struct IR {
           aux(std::move(extra)), imm(immediate) {
     }
 };
+
+struct BasicBlock {
+    size_t begin{};
+    size_t end{};
+    std::vector<size_t> predecessors;
+    std::vector<size_t> successors;
+};
+
+// 所有函数级数据流分析共享同一份基本块 CFG、支配关系和自然循环深度。
+struct FunctionCFG {
+    static constexpr size_t noBlock = std::numeric_limits<size_t>::max();
+    std::vector<BasicBlock> blocks;
+    std::vector<size_t> instructionBlock;
+    std::unordered_map<std::string, size_t> labelBlock;
+    std::vector<bool> reachable;
+    std::vector<std::unordered_set<size_t>> dominators;
+    std::vector<size_t> immediateDominator;
+    std::vector<std::vector<size_t>> dominatorChildren;
+    std::vector<std::unordered_set<size_t>> dominanceFrontier;
+    std::vector<int> loopDepth;
+};
+
+static FunctionCFG buildFunctionCFG(const std::vector<IR> &code) {
+    FunctionCFG cfg;
+    if (code.empty())
+        return cfg;
+
+    std::vector<bool> leader(code.size());
+    leader[0] = true;
+    for (size_t i = 0; i < code.size(); ++i) {
+        if (code[i].op == IR::Label)
+            leader[i] = true;
+        if ((code[i].op == IR::Jump || code[i].op == IR::BrZ || code[i].op == IR::Ret) &&
+            i + 1 < code.size())
+            leader[i + 1] = true;
+    }
+    std::vector<size_t> starts;
+    for (size_t i = 0; i < code.size(); ++i)
+        if (leader[i])
+            starts.push_back(i);
+    cfg.instructionBlock.resize(code.size());
+    for (size_t i = 0; i < starts.size(); ++i) {
+        const size_t end = i + 1 < starts.size() ? starts[i + 1] : code.size();
+        cfg.blocks.push_back({starts[i], end, {}, {}});
+        for (size_t position = starts[i]; position < end; ++position) {
+            cfg.instructionBlock[position] = i;
+            if (code[position].op == IR::Label)
+                cfg.labelBlock[code[position].x] = i;
+        }
+    }
+
+    auto addSuccessor = [&](size_t from, size_t to) {
+        if (to >= cfg.blocks.size())
+            return;
+        auto &successors = cfg.blocks[from].successors;
+        if (std::find(successors.begin(), successors.end(), to) == successors.end())
+            successors.push_back(to);
+    };
+    for (size_t block = 0; block < cfg.blocks.size(); ++block) {
+        const auto &range = cfg.blocks[block];
+        const IR &tail = code[range.end - 1];
+        if (tail.op == IR::Jump) {
+            if (auto target = cfg.labelBlock.find(tail.x); target != cfg.labelBlock.end())
+                addSuccessor(block, target->second);
+        } else if (tail.op == IR::BrZ) {
+            if (auto target = cfg.labelBlock.find(tail.y); target != cfg.labelBlock.end())
+                addSuccessor(block, target->second);
+            addSuccessor(block, block + 1);
+        } else if (tail.op != IR::Ret) {
+            addSuccessor(block, block + 1);
+        }
+    }
+    for (size_t block = 0; block < cfg.blocks.size(); ++block)
+        for (size_t successor : cfg.blocks[block].successors)
+            cfg.blocks[successor].predecessors.push_back(block);
+
+    const size_t count = cfg.blocks.size();
+    cfg.reachable.assign(count, false);
+    std::vector<size_t> work = {0};
+    while (!work.empty()) {
+        const size_t block = work.back();
+        work.pop_back();
+        if (cfg.reachable[block])
+            continue;
+        cfg.reachable[block] = true;
+        work.insert(work.end(), cfg.blocks[block].successors.begin(),
+                    cfg.blocks[block].successors.end());
+    }
+
+    std::unordered_set<size_t> allReachable;
+    for (size_t block = 0; block < count; ++block)
+        if (cfg.reachable[block])
+            allReachable.insert(block);
+    cfg.dominators.resize(count);
+    for (size_t block = 0; block < count; ++block)
+        if (cfg.reachable[block])
+            cfg.dominators[block] = block == 0 ? std::unordered_set<size_t>{0} : allReachable;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t block = 1; block < count; ++block) {
+            if (!cfg.reachable[block])
+                continue;
+            std::unordered_set<size_t> merged;
+            bool first = true;
+            for (size_t predecessor : cfg.blocks[block].predecessors) {
+                if (!cfg.reachable[predecessor])
+                    continue;
+                if (first) {
+                    merged = cfg.dominators[predecessor];
+                    first = false;
+                } else {
+                    for (auto it = merged.begin(); it != merged.end();) {
+                        if (!cfg.dominators[predecessor].contains(*it))
+                            it = merged.erase(it);
+                        else
+                            ++it;
+                    }
+                }
+            }
+            merged.insert(block);
+            if (merged != cfg.dominators[block]) {
+                cfg.dominators[block] = std::move(merged);
+                changed = true;
+            }
+        }
+    }
+
+    cfg.immediateDominator.assign(count, FunctionCFG::noBlock);
+    cfg.dominatorChildren.resize(count);
+    for (size_t block = 1; block < count; ++block) {
+        if (!cfg.reachable[block])
+            continue;
+        size_t best = FunctionCFG::noBlock;
+        for (size_t dominator : cfg.dominators[block]) {
+            if (dominator == block)
+                continue;
+            if (best == FunctionCFG::noBlock ||
+                cfg.dominators[dominator].size() > cfg.dominators[best].size())
+                best = dominator;
+        }
+        cfg.immediateDominator[block] = best;
+        if (best != FunctionCFG::noBlock)
+            cfg.dominatorChildren[best].push_back(block);
+    }
+
+    cfg.dominanceFrontier.resize(count);
+    for (size_t block = 0; block < count; ++block) {
+        if (!cfg.reachable[block] || cfg.blocks[block].predecessors.size() < 2)
+            continue;
+        for (size_t predecessor : cfg.blocks[block].predecessors) {
+            size_t runner = predecessor;
+            while (runner != cfg.immediateDominator[block] && runner != FunctionCFG::noBlock) {
+                cfg.dominanceFrontier[runner].insert(block);
+                runner = cfg.immediateDominator[runner];
+            }
+        }
+    }
+
+    cfg.loopDepth.assign(count, 0);
+    for (size_t latch = 0; latch < count; ++latch) {
+        for (size_t header : cfg.blocks[latch].successors) {
+            if (!cfg.dominators[latch].contains(header))
+                continue;
+            std::unordered_set<size_t> loop = {header, latch};
+            std::vector<size_t> reverseWork;
+            if (latch != header)
+                reverseWork.push_back(latch);
+            while (!reverseWork.empty()) {
+                const size_t block = reverseWork.back();
+                reverseWork.pop_back();
+                for (size_t predecessor : cfg.blocks[block].predecessors)
+                    if (loop.insert(predecessor).second)
+                        reverseWork.push_back(predecessor);
+            }
+            for (size_t block : loop)
+                ++cfg.loopDepth[block];
+        }
+    }
+    return cfg;
+}
 
 // Generator 同时负责 AST -> IR 的降低和 IR -> RV32 的线性代码生成。
 class Generator {
@@ -70,12 +253,71 @@ class Generator {
         return !value.empty() && (value[0] == 't' || value[0] == '@');
     }
 
+    static bool definesVirtualValue(const IR &ins) {
+        return isVirtual(ins.x) &&
+               (ins.op == IR::Mov || ins.op == IR::Bin || ins.op == IR::Load ||
+                ins.op == IR::Call || (ins.op == IR::Store && isVirtual(ins.x)));
+    }
+
+    static void rewriteUses(IR &ins, const std::function<void(std::string &)> &rewrite) {
+        if (ins.op == IR::Mov) {
+            if (!ins.y.empty())
+                rewrite(ins.y);
+        } else if (ins.op == IR::Bin) {
+            rewrite(ins.y);
+            rewrite(ins.z);
+        } else if (ins.op == IR::Load || ins.op == IR::Store) {
+            rewrite(ins.y);
+        } else if (ins.op == IR::Call) {
+            auto args = callArgs(ins.y);
+            for (auto &arg : args)
+                rewrite(arg);
+            ins.y = joinArgs(args);
+        } else if (ins.op == IR::BrZ) {
+            rewrite(ins.x);
+        }
+    }
+
     static int fromBits(std::uint32_t value) {
         return static_cast<int>(std::bit_cast<std::int32_t>(value));
     }
 
     static int wrapNeg(int value) {
         return fromBits(0U - static_cast<std::uint32_t>(value));
+    }
+
+    struct SignedDivisionMagic {
+        int multiplier{};
+        int shift{};
+    };
+
+    // Hacker's Delight 的有符号常量除法 magic-number 算法；divisor 必须为正且大于 1。
+    static SignedDivisionMagic signedDivisionMagic(std::uint32_t divisor) {
+        const std::uint64_t two31 = std::uint64_t{1} << 31;
+        const std::uint64_t anc = two31 - 1 - (two31 - 1) % divisor;
+        int precision = 31;
+        std::uint64_t quotient1 = two31 / anc;
+        std::uint64_t remainder1 = two31 - quotient1 * anc;
+        std::uint64_t quotient2 = two31 / divisor;
+        std::uint64_t remainder2 = two31 - quotient2 * divisor;
+        std::uint64_t delta;
+        do {
+            ++precision;
+            quotient1 *= 2;
+            remainder1 *= 2;
+            if (remainder1 >= anc) {
+                ++quotient1;
+                remainder1 -= anc;
+            }
+            quotient2 *= 2;
+            remainder2 *= 2;
+            if (remainder2 >= divisor) {
+                ++quotient2;
+                remainder2 -= divisor;
+            }
+            delta = divisor - remainder2;
+        } while (quotient1 < delta || (quotient1 == delta && remainder1 == 0));
+        return {fromBits(static_cast<std::uint32_t>(quotient2 + 1)), precision - 32};
     }
 
     static std::unordered_map<std::string, int> immediateConstants(const std::vector<IR> &code) {
@@ -313,6 +555,582 @@ class Generator {
                 begin = end;
             }
         }
+    }
+
+    // 将简单线性归纳变量乘以循环常量改写为累加器，减少热循环中的乘法。
+    // 仅处理单一回边、单一入口和单一递增定义，复杂循环继续保留原始表达式。
+    void strengthReduceLoops() {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t begin = 0; begin < ir_.size() && !changed;) {
+                size_t end = begin + 1;
+                while (end < ir_.size() &&
+                       !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
+                    ++end;
+                std::vector<IR> code(ir_.begin() + begin, ir_.begin() + end);
+                const auto cfg = buildFunctionCFG(code);
+                if (cfg.blocks.empty()) {
+                    begin = end;
+                    continue;
+                }
+                const auto constants = immediateConstants(code);
+
+                for (size_t latch = 0; latch < cfg.blocks.size() && !changed; ++latch) {
+                    for (size_t header : cfg.blocks[latch].successors) {
+                        if (header == latch || !cfg.dominators[latch].contains(header))
+                            continue;
+                        std::unordered_set<size_t> loopBlocks = {header, latch};
+                        std::vector<size_t> reverseWork = {latch};
+                        while (!reverseWork.empty()) {
+                            const size_t block = reverseWork.back();
+                            reverseWork.pop_back();
+                            for (size_t predecessor : cfg.blocks[block].predecessors)
+                                if (loopBlocks.insert(predecessor).second && predecessor != header)
+                                    reverseWork.push_back(predecessor);
+                        }
+                        std::vector<size_t> outside;
+                        for (size_t predecessor : cfg.blocks[header].predecessors)
+                            if (!loopBlocks.contains(predecessor))
+                                outside.push_back(predecessor);
+                        if (outside.size() != 1)
+                            continue;
+                        const size_t preheader = outside.front();
+                        const auto &loopRange = cfg.blocks[header];
+                        const auto &latchRange = cfg.blocks[latch];
+                        if (loopRange.begin >= code.size() || latchRange.end > code.size())
+                            continue;
+
+                        struct Induction {
+                            std::string value;
+                            std::string stepValue;
+                            int step{};
+                            size_t update{};
+                        } induction;
+                        int updates = 0;
+                        for (size_t i = loopRange.begin; i + 1 < latchRange.end; ++i) {
+                            const auto &add = code[i];
+                            const auto &move = code[i + 1];
+                            if (add.op != IR::Bin || add.aux != "+" || !isVirtual(add.x) ||
+                                move.op != IR::Mov || !isVirtual(move.x) || move.x.empty() ||
+                                move.y != add.x)
+                                continue;
+                            std::string stepValue;
+                            if (constants.contains(add.y) && isVirtual(add.z)) {
+                                stepValue = add.y;
+                            } else if (constants.contains(add.z) && isVirtual(add.y)) {
+                                stepValue = add.z;
+                            } else {
+                                continue;
+                            }
+                            const std::string base = move.x;
+                            if ((add.y != base && add.z != base) ||
+                                (add.y != base && add.y != stepValue) ||
+                                (add.z != base && add.z != stepValue))
+                                continue;
+                            if (++updates > 1)
+                                break;
+                            induction = {base, stepValue, constants.at(stepValue), i + 1};
+                        }
+                        if (updates != 1)
+                            continue;
+
+                        // 初值必须在循环外唯一确定，避免给多个入口合成错误的初始累加器。
+                        int baseDefinitions = 0;
+                        for (size_t i = 0; i < loopRange.begin; ++i)
+                            if (definesVirtualValue(code[i]) && code[i].x == induction.value)
+                                ++baseDefinitions;
+                        if (baseDefinitions != 1)
+                            continue;
+
+                        std::vector<std::pair<size_t, bool>> multiplications;
+                        for (size_t i = loopRange.begin; i < latchRange.end; ++i) {
+                            const auto &ins = code[i];
+                            if (ins.op != IR::Bin || ins.aux != "*")
+                                continue;
+                            std::string factor;
+                            if (ins.y == induction.value && constants.contains(ins.z))
+                                factor = ins.z;
+                            else if (ins.z == induction.value && constants.contains(ins.y))
+                                factor = ins.y;
+                            if (factor.empty())
+                                continue;
+                            const int multiplier = constants.at(factor);
+                            const auto magnitude = multiplier < 0
+                                                       ? 0U - static_cast<std::uint32_t>(multiplier)
+                                                       : static_cast<std::uint32_t>(multiplier);
+                            const bool powerOfTwo = magnitude && (magnitude & (magnitude - 1)) == 0;
+                            if (multiplier == 0 || multiplier == 1 || powerOfTwo ||
+                                multiplier == 3 || multiplier == 5 || multiplier == 7 ||
+                                multiplier == 9)
+                                continue;
+                            // 记录归纳变量是否位于左操作数，替换时只改写该操作数。
+                            multiplications.emplace_back(i, ins.y == induction.value);
+                        }
+                        if (multiplications.empty())
+                            continue;
+
+                        const bool baseIsLeft = multiplications.front().second;
+                        const int delta =
+                            fromBits(static_cast<std::uint32_t>(induction.step) *
+                                     static_cast<std::uint32_t>(constants.at(
+                                         baseIsLeft ? code[multiplications.front().first].z
+                                                    : code[multiplications.front().first].y)));
+                        const std::string factor = baseIsLeft
+                                                       ? code[multiplications.front().first].z
+                                                       : code[multiplications.front().first].y;
+                        if (std::any_of(multiplications.begin(), multiplications.end(),
+                                        [&](const auto &entry) {
+                                            const auto &ins = code[entry.first];
+                                            const std::string current =
+                                                entry.second ? ins.z : ins.y;
+                                            return current != factor;
+                                        }))
+                            continue;
+
+                        const std::string accumulator = tmp();
+                        const std::string deltaValue = tmp();
+                        IR initial(IR::Bin, accumulator, induction.value, factor, "*");
+                        IR deltaInstruction(IR::Mov, deltaValue, {}, {}, {}, delta);
+                        IR update(IR::Bin, accumulator, accumulator, deltaValue, "+");
+
+                        std::vector<IR> rewritten;
+                        rewritten.reserve(code.size() + 3);
+                        const auto &preheaderRange = cfg.blocks[preheader];
+                        for (size_t i = 0; i < code.size(); ++i) {
+                            if (i == preheaderRange.end - 1 &&
+                                (code[i].op == IR::Jump || code[i].op == IR::BrZ)) {
+                                rewritten.push_back(std::move(deltaInstruction));
+                                rewritten.push_back(std::move(initial));
+                            }
+                            if (i == induction.update) {
+                                rewritten.push_back(std::move(code[i]));
+                                rewritten.push_back(update);
+                                continue;
+                            }
+                            bool replaced = false;
+                            for (const auto &entry : multiplications)
+                                if (entry.first == i) {
+                                    IR replacement = std::move(code[i]);
+                                    replacement.op = IR::Mov;
+                                    replacement.y = accumulator;
+                                    replacement.z.clear();
+                                    replacement.aux.clear();
+                                    rewritten.push_back(std::move(replacement));
+                                    replaced = true;
+                                    break;
+                                }
+                            if (!replaced)
+                                rewritten.push_back(std::move(code[i]));
+                        }
+                        if (preheaderRange.end == code.size() ||
+                            (code[preheaderRange.end - 1].op != IR::Jump &&
+                             code[preheaderRange.end - 1].op != IR::BrZ)) {
+                            // 落空前驱块没有显式终结跳转时，初始化必须追加到其末尾。
+                            const size_t insertAt = preheaderRange.end;
+                            rewritten.insert(rewritten.begin() +
+                                                 static_cast<std::ptrdiff_t>(insertAt),
+                                             {std::move(deltaInstruction), std::move(initial)});
+                        }
+                        std::vector<IR> next;
+                        next.reserve(ir_.size() - code.size() + rewritten.size());
+                        next.insert(next.end(), ir_.begin(), ir_.begin() + begin);
+                        next.insert(next.end(), std::make_move_iterator(rewritten.begin()),
+                                    std::make_move_iterator(rewritten.end()));
+                        next.insert(next.end(), ir_.begin() + end, ir_.end());
+                        ir_ = std::move(next);
+                        changed = true;
+                        break;
+                    }
+                }
+                begin = end;
+            }
+        }
+    }
+
+    // 按自然循环深度形成热路径 trace；重排后显式补齐被打断的落空边。
+    void layoutHotBlocks() {
+        std::vector<IR> laidOut;
+        for (size_t begin = 0; begin < ir_.size();) {
+            size_t end = begin + 1;
+            while (end < ir_.size() &&
+                   !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
+                ++end;
+            std::vector<IR> code(ir_.begin() + begin, ir_.begin() + end);
+            const auto cfg = buildFunctionCFG(code);
+            if (cfg.blocks.size() < 2) {
+                laidOut.insert(laidOut.end(), std::make_move_iterator(code.begin()),
+                               std::make_move_iterator(code.end()));
+                begin = end;
+                continue;
+            }
+
+            std::vector<size_t> order;
+            std::vector<bool> placed(cfg.blocks.size(), false);
+            size_t current = 0;
+            while (order.size() < cfg.blocks.size()) {
+                if (!placed[current]) {
+                    placed[current] = true;
+                    order.push_back(current);
+                }
+                size_t best = FunctionCFG::noBlock;
+                int bestScore = std::numeric_limits<int>::min();
+                for (size_t successor : cfg.blocks[current].successors) {
+                    if (placed[successor])
+                        continue;
+                    const int fallthroughBonus = successor == current + 1 ? 8 : 0;
+                    const int score = cfg.loopDepth[successor] * 100 + fallthroughBonus;
+                    if (best == FunctionCFG::noBlock || score > bestScore) {
+                        best = successor;
+                        bestScore = score;
+                    }
+                }
+                if (best == FunctionCFG::noBlock) {
+                    for (size_t candidate = 0; candidate < cfg.blocks.size(); ++candidate)
+                        if (!placed[candidate]) {
+                            best = candidate;
+                            break;
+                        }
+                }
+                current = best;
+            }
+
+            std::vector<std::string> blockLabels(cfg.blocks.size());
+            for (size_t block = 0; block < cfg.blocks.size(); ++block)
+                for (size_t i = cfg.blocks[block].begin; i < cfg.blocks[block].end; ++i)
+                    if (code[i].op == IR::Label) {
+                        blockLabels[block] = code[i].x;
+                        break;
+                    }
+
+            for (size_t position = 0; position < order.size(); ++position) {
+                const size_t block = order[position];
+                const auto &range = cfg.blocks[block];
+                const IR::Op tailOp = code[range.end - 1].op;
+                laidOut.insert(laidOut.end(), std::make_move_iterator(code.begin() + range.begin),
+                               std::make_move_iterator(code.begin() + range.end));
+                const size_t next =
+                    position + 1 < order.size() ? order[position + 1] : FunctionCFG::noBlock;
+                if (tailOp == IR::BrZ) {
+                    const size_t fallthrough =
+                        block + 1 < cfg.blocks.size() ? block + 1 : FunctionCFG::noBlock;
+                    if (fallthrough != FunctionCFG::noBlock && next != fallthrough)
+                        laidOut.emplace_back(IR::Jump, blockLabels[fallthrough]);
+                } else if (tailOp != IR::Jump && tailOp != IR::Ret) {
+                    const size_t fallthrough =
+                        block + 1 < cfg.blocks.size() ? block + 1 : FunctionCFG::noBlock;
+                    if (fallthrough != FunctionCFG::noBlock && next != fallthrough)
+                        laidOut.emplace_back(IR::Jump, blockLabels[fallthrough]);
+                }
+            }
+            begin = end;
+        }
+        ir_ = std::move(laidOut);
+    }
+
+    // 在函数基本块上构造轻量 SSA，执行支配树 GVN 后再用关键边拆分消除 phi。
+    std::vector<IR> optimizeSSAFunction(const std::vector<IR> &code) {
+        struct PhiNode {
+            std::string base;
+            std::string result;
+            std::unordered_map<size_t, std::string> incoming;
+            bool removed{};
+        };
+        struct SSABlock {
+            std::vector<IR> instructions;
+            std::vector<bool> removed;
+            std::vector<PhiNode> phis;
+            std::string label;
+        };
+        const auto cfg = buildFunctionCFG(code);
+        if (cfg.blocks.empty())
+            return code;
+
+        std::vector<SSABlock> blocks(cfg.blocks.size());
+        std::unordered_map<std::string, std::unordered_set<size_t>> definitionBlocks;
+        std::unordered_map<std::string, int> definitionCount;
+        for (size_t block = 0; block < cfg.blocks.size(); ++block) {
+            const auto &range = cfg.blocks[block];
+            blocks[block].instructions.assign(code.begin() + range.begin, code.begin() + range.end);
+            if (!blocks[block].instructions.empty() &&
+                blocks[block].instructions.front().op == IR::Label) {
+                blocks[block].label = blocks[block].instructions.front().x;
+            } else {
+                blocks[block].label = label();
+                blocks[block].instructions.insert(blocks[block].instructions.begin(),
+                                                  {IR::Label, blocks[block].label});
+            }
+            for (const auto &ins : blocks[block].instructions)
+                if (definesVirtualValue(ins)) {
+                    definitionBlocks[ins.x].insert(block);
+                    ++definitionCount[ins.x];
+                }
+        }
+
+        std::vector<std::string> candidates;
+        for (const auto &[value, count] : definitionCount)
+            if ((!value.empty() && value[0] == '@') || count > 1)
+                candidates.push_back(value);
+        std::sort(candidates.begin(), candidates.end());
+
+        // Cytron 支配边界算法：仅为真正多路径汇合的可变值插入 phi。
+        for (const auto &value : candidates) {
+            std::vector<size_t> work(definitionBlocks[value].begin(),
+                                     definitionBlocks[value].end());
+            std::unordered_set<size_t> queued(work.begin(), work.end());
+            std::unordered_set<size_t> hasPhi;
+            while (!work.empty()) {
+                const size_t block = work.back();
+                work.pop_back();
+                std::vector<size_t> frontier(cfg.dominanceFrontier[block].begin(),
+                                             cfg.dominanceFrontier[block].end());
+                std::sort(frontier.begin(), frontier.end());
+                for (size_t destination : frontier) {
+                    if (!cfg.reachable[destination] || !hasPhi.insert(destination).second)
+                        continue;
+                    blocks[destination].phis.push_back({value, {}, {}, false});
+                    if (!definitionBlocks[value].contains(destination) &&
+                        queued.insert(destination).second)
+                        work.push_back(destination);
+                }
+            }
+        }
+        for (auto &block : blocks)
+            std::sort(block.phis.begin(), block.phis.end(),
+                      [](const auto &left, const auto &right) { return left.base < right.base; });
+
+        std::unordered_map<std::string, int> counters;
+        std::unordered_map<std::string, std::vector<std::string>> stacks;
+        std::unordered_set<std::string> candidateSet(candidates.begin(), candidates.end());
+        auto fresh = [&](const std::string &base) {
+            return base + "#" + std::to_string(counters[base]++);
+        };
+        std::function<void(size_t)> renameBlock = [&](size_t block) {
+            std::vector<std::string> pushed;
+            for (auto &phi : blocks[block].phis) {
+                phi.result = fresh(phi.base);
+                stacks[phi.base].push_back(phi.result);
+                pushed.push_back(phi.base);
+            }
+            for (auto &ins : blocks[block].instructions) {
+                rewriteUses(ins, [&](std::string &value) {
+                    if (candidateSet.contains(value) && !stacks[value].empty())
+                        value = stacks[value].back();
+                });
+                if (definesVirtualValue(ins) && candidateSet.contains(ins.x)) {
+                    const std::string base = ins.x;
+                    ins.x = fresh(base);
+                    stacks[base].push_back(ins.x);
+                    pushed.push_back(base);
+                }
+            }
+            for (size_t successor : cfg.blocks[block].successors)
+                for (auto &phi : blocks[successor].phis)
+                    phi.incoming[block] =
+                        stacks[phi.base].empty() ? phi.base : stacks[phi.base].back();
+            auto children = cfg.dominatorChildren[block];
+            std::sort(children.begin(), children.end());
+            for (size_t child : children)
+                renameBlock(child);
+            for (auto it = pushed.rbegin(); it != pushed.rend(); ++it)
+                stacks[*it].pop_back();
+        };
+        renameBlock(0);
+
+        std::unordered_map<std::string, std::string> aliases;
+        auto resolve = [&](std::string value) {
+            std::unordered_set<std::string> seen;
+            while (aliases.contains(value) && seen.insert(value).second)
+                value = aliases[value];
+            return value;
+        };
+        auto simplifyPhis = [&] {
+            bool changed = false;
+            for (auto &block : blocks)
+                for (auto &phi : block.phis) {
+                    if (phi.removed)
+                        continue;
+                    std::string common;
+                    bool same = true;
+                    for (auto &[predecessor, value] : phi.incoming) {
+                        value = resolve(value);
+                        if (value == phi.result)
+                            continue;
+                        if (common.empty())
+                            common = value;
+                        else if (common != value)
+                            same = false;
+                    }
+                    if (same && !common.empty()) {
+                        aliases[phi.result] = common;
+                        phi.removed = true;
+                        changed = true;
+                    }
+                }
+            return changed;
+        };
+        while (simplifyPhis()) {
+        }
+
+        const std::unordered_set<std::string> commutative = {"+", "*", "==", "!="};
+        std::function<void(size_t, std::unordered_map<std::string, std::string>)> numberBlock;
+        numberBlock = [&](size_t block, std::unordered_map<std::string, std::string> available) {
+            blocks[block].removed.assign(blocks[block].instructions.size(), false);
+            for (size_t i = 0; i < blocks[block].instructions.size(); ++i) {
+                auto &ins = blocks[block].instructions[i];
+                rewriteUses(ins, [&](std::string &value) { value = resolve(value); });
+                if (ins.op == IR::Mov && isVirtual(ins.x) && isVirtual(ins.y)) {
+                    aliases[ins.x] = resolve(ins.y);
+                    blocks[block].removed[i] = true;
+                } else if (ins.op == IR::Bin && isVirtual(ins.x)) {
+                    std::string left = resolve(ins.y), right = resolve(ins.z);
+                    if (commutative.contains(ins.aux) && right < left)
+                        std::swap(left, right);
+                    const std::string key = ins.aux + "\n" + left + "\n" + right;
+                    if (auto found = available.find(key); found != available.end()) {
+                        aliases[ins.x] = resolve(found->second);
+                        blocks[block].removed[i] = true;
+                    } else {
+                        available[key] = ins.x;
+                    }
+                }
+            }
+            auto children = cfg.dominatorChildren[block];
+            std::sort(children.begin(), children.end());
+            for (size_t child : children)
+                numberBlock(child, available);
+        };
+        numberBlock(0, {});
+        while (simplifyPhis()) {
+        }
+        for (auto &block : blocks) {
+            for (auto &ins : block.instructions)
+                rewriteUses(ins, [&](std::string &value) { value = resolve(value); });
+            for (auto &phi : block.phis)
+                for (auto &[predecessor, value] : phi.incoming)
+                    value = resolve(value);
+        }
+
+        using Edge = std::pair<size_t, size_t>;
+        std::map<Edge, std::vector<std::pair<std::string, std::string>>> edgeMoves;
+        for (size_t block = 0; block < blocks.size(); ++block)
+            for (const auto &phi : blocks[block].phis) {
+                if (phi.removed)
+                    continue;
+                for (size_t predecessor : cfg.blocks[block].predecessors) {
+                    auto found = phi.incoming.find(predecessor);
+                    if (found == phi.incoming.end())
+                        continue;
+                    const std::string source = resolve(found->second);
+                    if (source != phi.result)
+                        edgeMoves[{predecessor, block}].push_back({phi.result, source});
+                }
+            }
+
+        auto parallelCopies = [&](std::vector<std::pair<std::string, std::string>> moves) {
+            std::vector<IR> copies;
+            while (!moves.empty()) {
+                auto ready = moves.end();
+                for (auto candidate = moves.begin(); candidate != moves.end(); ++candidate) {
+                    const bool targetIsSource =
+                        std::any_of(moves.begin(), moves.end(), [&](const auto &move) {
+                            return move.second == candidate->first;
+                        });
+                    if (!targetIsSource) {
+                        ready = candidate;
+                        break;
+                    }
+                }
+                if (ready == moves.end()) {
+                    const std::string savedTarget = moves.front().first;
+                    const std::string temporary = tmp();
+                    copies.emplace_back(IR::Mov, temporary, savedTarget);
+                    for (auto &move : moves)
+                        if (move.second == savedTarget)
+                            move.second = temporary;
+                    continue;
+                }
+                copies.emplace_back(IR::Mov, ready->first, ready->second);
+                moves.erase(ready);
+            }
+            return copies;
+        };
+
+        struct EdgeBlock {
+            std::string label;
+            std::string target;
+            std::vector<IR> copies;
+        };
+        std::vector<EdgeBlock> splitEdges;
+        std::vector<IR> result;
+        for (size_t block = 0; block < blocks.size(); ++block) {
+            std::vector<IR> instructions;
+            for (size_t i = 0; i < blocks[block].instructions.size(); ++i)
+                if (blocks[block].removed.empty() || !blocks[block].removed[i])
+                    instructions.push_back(std::move(blocks[block].instructions[i]));
+            if (instructions.empty())
+                continue;
+
+            if (cfg.blocks[block].successors.size() == 1) {
+                const size_t successor = cfg.blocks[block].successors.front();
+                auto found = edgeMoves.find({block, successor});
+                if (found != edgeMoves.end()) {
+                    auto copies = parallelCopies(found->second);
+                    const bool beforeTerminator =
+                        instructions.back().op == IR::Jump || instructions.back().op == IR::BrZ;
+                    instructions.insert(beforeTerminator ? instructions.end() - 1
+                                                         : instructions.end(),
+                                        std::make_move_iterator(copies.begin()),
+                                        std::make_move_iterator(copies.end()));
+                }
+            } else if (cfg.blocks[block].successors.size() > 1 &&
+                       instructions.back().op == IR::BrZ) {
+                const auto originalTarget = cfg.labelBlock.find(instructions.back().y);
+                const size_t taken = originalTarget == cfg.labelBlock.end()
+                                         ? FunctionCFG::noBlock
+                                         : originalTarget->second;
+                std::optional<std::string> fallthroughEdge;
+                for (size_t successor : cfg.blocks[block].successors) {
+                    auto found = edgeMoves.find({block, successor});
+                    if (found == edgeMoves.end())
+                        continue;
+                    const std::string edgeLabel = label();
+                    splitEdges.push_back(
+                        {edgeLabel, blocks[successor].label, parallelCopies(found->second)});
+                    if (successor == taken)
+                        instructions.back().y = edgeLabel;
+                    else
+                        fallthroughEdge = edgeLabel;
+                }
+                if (fallthroughEdge)
+                    instructions.emplace_back(IR::Jump, *fallthroughEdge);
+            }
+            result.insert(result.end(), std::make_move_iterator(instructions.begin()),
+                          std::make_move_iterator(instructions.end()));
+        }
+        for (auto &edge : splitEdges) {
+            result.emplace_back(IR::Label, edge.label);
+            result.insert(result.end(), std::make_move_iterator(edge.copies.begin()),
+                          std::make_move_iterator(edge.copies.end()));
+            result.emplace_back(IR::Jump, edge.target);
+        }
+        return result;
+    }
+
+    void optimizeSSA() {
+        std::vector<IR> result;
+        for (size_t begin = 0; begin < ir_.size();) {
+            size_t end = begin + 1;
+            while (end < ir_.size() &&
+                   !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
+                ++end;
+            std::vector<IR> code(ir_.begin() + begin, ir_.begin() + end);
+            auto optimized = optimizeSSAFunction(code);
+            result.insert(result.end(), std::make_move_iterator(optimized.begin()),
+                          std::make_move_iterator(optimized.end()));
+            begin = end;
+        }
+        ir_ = std::move(result);
     }
 
     // 把常量条件分支转换为确定跳转，并按函数 CFG 删除不可达指令。
@@ -1018,18 +1836,10 @@ class Generator {
         std::unordered_set<std::string> values;
         std::unordered_map<std::string, long long> spillWeight;
         std::unordered_map<std::string, std::string> incomingRegisters;
+        const auto cfg = buildFunctionCFG(code);
         std::vector<int> loopDepth(count);
-        for (size_t i = 0; i < count; ++i) {
-            auto markLoop = [&](const std::string &target) {
-                if (auto found = labels.find(target); found != labels.end() && found->second <= i)
-                    for (size_t position = found->second; position <= i; ++position)
-                        ++loopDepth[position];
-            };
-            if (code[i].op == IR::Jump)
-                markLoop(code[i].x);
-            else if (code[i].op == IR::BrZ)
-                markLoop(code[i].y);
-        }
+        for (size_t i = 0; i < count; ++i)
+            loopDepth[i] = cfg.loopDepth[cfg.instructionBlock[i]];
 
         // 只让循环内原本需要 li 的常量参与分配；可直接编码为立即数的常量仍按使用点折叠。
         std::unordered_map<std::string, long long> constantBenefit;
@@ -1544,12 +2354,19 @@ class Generator {
             eliminateCommonSubexpressions();
             simplifyIR();
             hoistLoopInvariants();
+            strengthReduceLoops();
             eliminateCommonSubexpressions();
             simplifyIR();
+            eliminateDeadDefinitions();
+            optimizeSSA();
+            simplifyIR();
+            simplifyControlFlow();
             eliminateDeadDefinitions();
             coalesceAdjacentMoves();
             simplifyIR();
             eliminateDeadDefinitions();
+            layoutHotBlocks();
+            simplifyIR();
         }
     }
 
@@ -1568,7 +2385,29 @@ class Generator {
                    !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
                 ++end;
             std::vector<IR> code(ir_.begin() + begin, ir_.begin() + end);
-            const auto constants = immediateConstants(code);
+            auto constants = immediateConstants(code);
+            // 多个控制流分支若都定义同一个立即数，重物化比保存临时值更便宜。
+            std::unordered_map<std::string, int> rematerialized;
+            std::unordered_set<std::string> rematerializationCandidates;
+            std::unordered_set<std::string> invalidRematerialization;
+            for (const auto &ins : code) {
+                if (!definesVirtualValue(ins) || ins.x.empty() || ins.x[0] != 't')
+                    continue;
+                if (ins.op == IR::Mov && ins.y.empty() &&
+                    !invalidRematerialization.contains(ins.x)) {
+                    if (auto found = rematerialized.find(ins.x); found == rematerialized.end())
+                        rematerialized[ins.x] = ins.imm;
+                    else if (found->second != ins.imm)
+                        invalidRematerialization.insert(ins.x);
+                    rematerializationCandidates.insert(ins.x);
+                } else {
+                    invalidRematerialization.insert(ins.x);
+                    rematerializationCandidates.erase(ins.x);
+                }
+            }
+            for (const auto &value : rematerializationCandidates)
+                if (!invalidRematerialization.contains(value))
+                    constants[value] = rematerialized[value];
             auto allocation = opt_ ? allocateRegisters(code, constants)
                                    : std::unordered_map<std::string, std::string>{};
             const bool hasCall = std::any_of(code.begin(), code.end(),
@@ -1816,11 +2655,19 @@ class Generator {
                         const std::uint32_t magnitude =
                             divisor < 0 ? 0U - static_cast<std::uint32_t>(divisor)
                                         : static_cast<std::uint32_t>(divisor);
-                        if (magnitude > 1 && (magnitude & (magnitude - 1)) == 0) {
+                        const auto source = reg(ins.y, "t1");
+                        if (magnitude == 1) {
+                            if (ins.aux == "%")
+                                o << "  li " << target << ", 0\n";
+                            else if (divisor < 0)
+                                o << "  neg " << target << ", " << source << "\n";
+                            else if (target != source)
+                                o << "  mv " << target << ", " << source << "\n";
+                            emitted = true;
+                        } else if ((magnitude & (magnitude - 1)) == 0) {
                             int shift = 0;
                             for (std::uint32_t value = magnitude; value > 1; value >>= 1)
                                 ++shift;
-                            const auto source = reg(ins.y, "t1");
                             o << "  srai t2, " << source << ", 31\n"
                               << "  srli t2, t2, " << (32 - shift) << "\n"
                               << "  add t2, " << source << ", t2\n"
@@ -1833,6 +2680,28 @@ class Generator {
                             } else {
                                 o << "  slli t2, t2, " << shift << "\n"
                                   << "  sub " << target << ", " << source << ", t2\n";
+                            }
+                            emitted = true;
+                        } else if (opt_) {
+                            // RV32IM 的 div/rem 通常远慢于 mulh；5-9 条定长序列更适合常量除数。
+                            const auto magic = signedDivisionMagic(magnitude);
+                            o << "  li t2, " << magic.multiplier << "\n"
+                              << "  mulh t2, " << source << ", t2\n";
+                            if (magic.multiplier < 0)
+                                o << "  add t2, t2, " << source << "\n";
+                            if (magic.shift)
+                                o << "  srai t2, t2, " << magic.shift << "\n";
+                            o << "  srli t3, t2, 31\n"
+                              << "  add t2, t2, t3\n";
+                            if (divisor < 0)
+                                o << "  neg t2, t2\n";
+                            if (ins.aux == "/") {
+                                if (target != "t2")
+                                    o << "  mv " << target << ", t2\n";
+                            } else {
+                                o << "  li t3, " << divisor << "\n"
+                                  << "  mul t3, t2, t3\n"
+                                  << "  sub " << target << ", " << source << ", t3\n";
                             }
                             emitted = true;
                         }

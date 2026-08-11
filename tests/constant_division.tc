@@ -1,0 +1,15 @@
+int check_negative(int value) {
+  return value / 10 == -1234 && value % 10 == -5 &&
+         value / -7 == 1763 && value % -7 == -4 &&
+         value / 37 == -333 && value % 37 == -24;
+}
+
+int check_positive(int value) {
+  return value / 10 == 1234 && value % 10 == 5 &&
+         value / -7 == -1763 && value % -7 == 4 &&
+         value / 37 == 333 && value % 37 == 24;
+}
+
+int main() {
+  return check_negative(-12345) && check_positive(12345);
+}

@@ -13,11 +13,8 @@ read_left:
   mv a0, t4
   ret
 write_right:
-  mv t4, a0
-  mv t5, t4
   la t1, right
-  sw t4, 0(t1)
-  mv a0, t5
+  sw a0, 0(t1)
   ret
 recursive_update:
   addi sp, sp, -16
@@ -29,8 +26,8 @@ recursive_update:
   lw s1, 0(t1)
   add t4, t4, a0
   bgt a0, zero, .L8
-  mv t5, t4
-  add t5, t5, s1
+.L36:
+  add t5, t4, s1
   la t1, left
   sw t4, 0(t1)
   mv a0, t5
@@ -70,8 +67,7 @@ main:
   lw s1, 0(t1)
   call read_left
   mv t4, a0
-  add t4, t4, s1
-  mv a0, t4
+  add a0, t4, s1
   lw s1, 8(sp)
   lw ra, 12(sp)
   addi sp, sp, 16

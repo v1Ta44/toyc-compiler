@@ -54,24 +54,25 @@ main:
   addi sp, sp, -16
   sw ra, 12(sp)
   sw s1, 8(sp)
-  sw s2, 4(sp)
   li t5, 4
   li t6, 2
   la t1, total
-  lw s1, 0(t1)
+  lw a0, 0(t1)
   li t4, 0
+  mv s1, a0
 .L43:
   bge t4, t5, .L44
+.L85:
   bne t4, t6, .L49
+.L86:
   addi t4, t4, 1
   j .L43
 .L49:
   add a0, s1, t4
-  mv s1, a0
   addi t4, t4, 1
+  mv s1, a0
   j .L43
 .L44:
-  mv s2, s1
   mv a1, t6
   mv a3, t5
   li a0, 1
@@ -82,12 +83,11 @@ main:
   li a7, 8
   call reverse_forward
   mv t4, a0
-  add t4, s2, t4
+  add t4, s1, t4
   la t1, total
   sw s1, 0(t1)
   mv a0, t4
   lw s1, 8(sp)
-  lw s2, 4(sp)
   lw ra, 12(sp)
   addi sp, sp, 16
   ret

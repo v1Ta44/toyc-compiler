@@ -65,6 +65,7 @@ kernel:
   mv t0, t1
   sw t0, 40(sp)
   lw t1, 40(sp)
+  lw t1, 40(sp)
   li t2, 3
   div t0, t1, t2
   sw t0, 44(sp)

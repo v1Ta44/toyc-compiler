@@ -1,0 +1,9 @@
+int main() {
+  int index = 0;
+  int sum = 0;
+  while (index < 100) {
+    sum = sum + index * 10;
+    index = index + 1;
+  }
+  return sum == 49500;
+}

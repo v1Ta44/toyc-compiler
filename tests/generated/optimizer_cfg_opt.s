@@ -2,27 +2,31 @@
 .globl main
 choose:
   beqz a0, .L3
+.L40:
   li t4, 20
-  j .L4
-.L3:
-  li t4, 30
 .L4:
   mv a0, t4
   ret
+.L3:
+  li t4, 30
+  j .L4
 main:
   addi sp, sp, -16
   sw ra, 12(sp)
   sw s1, 8(sp)
-  li t6, 5
+  li t5, 5
   li t4, 0
-  li s1, 1
+  li t6, 1
+  mv s1, t6
 .L11:
-  bge t4, t6, .L12
-  add s1, s1, t4
+  bge t4, t5, .L12
+.L41:
+  add t6, s1, t4
   addi t4, t4, 1
+  mv s1, t6
   j .L11
 .L12:
-  sub t4, t4, t6
+  sub t4, t4, t5
   seqz t4, t4
   mv a0, t4
   call choose

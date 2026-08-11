@@ -10,11 +10,8 @@ read_total:
   mv a0, t4
   ret
 set_total:
-  mv t4, a0
-  mv t5, t4
   la t1, total
-  sw t4, 0(t1)
-  mv a0, t5
+  sw a0, 0(t1)
   ret
 kernel:
   addi sp, sp, -16
@@ -22,16 +19,22 @@ kernel:
   sw s1, 8(sp)
   li t5, 20
   la t1, total
-  lw s1, 0(t1)
+  lw a2, 0(t1)
   li t4, 0
   mul t6, a0, a1
-  li t2, 3
-  div a1, a0, t2
+  li t2, 1431655766
+  mulh t2, a0, t2
+  srli t3, t2, 31
+  add t2, t2, t3
+  mv a0, t2
+  mv s1, a2
 .L7:
   bge t4, t5, .L8
-  add a0, s1, t6
-  add s1, a0, a1
+.L39:
+  add a1, s1, t6
+  add a1, a1, a0
   addi t4, t4, 1
+  mv s1, a1
   j .L7
 .L8:
   la t1, total
@@ -45,10 +48,9 @@ kernel:
   call set_total
   mv t4, a0
   la t1, total
-  lw s1, 0(t1)
-  mv t4, s1
+  lw t4, 0(t1)
   la t1, total
-  sw s1, 0(t1)
+  sw t4, 0(t1)
   mv a0, t4
   lw s1, 8(sp)
   lw ra, 12(sp)
