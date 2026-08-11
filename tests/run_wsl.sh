@@ -49,3 +49,18 @@ run_case recursion 120 normal
 run_case recursion 120 opt
 run_case control_flow 1 normal
 run_case control_flow 1 opt
+run_case optimizations 1 normal
+run_case optimizations 1 opt
+run_case register_pressure 78 normal
+run_case register_pressure 78 opt
+
+# 专用用例中有两组重复的加法和乘法；优化版应各只保留每组的一条指令。
+normal_mul_count="$(grep -c '^  mul ' "${generated_dir}/optimizations.s")"
+opt_mul_count="$(grep -c '^  mul ' "${generated_dir}/optimizations_opt.s")"
+normal_add_count="$(grep -c '^  add ' "${generated_dir}/optimizations.s")"
+opt_add_count="$(grep -c '^  add ' "${generated_dir}/optimizations_opt.s")"
+if (( opt_mul_count >= normal_mul_count || opt_add_count >= normal_add_count )); then
+    echo "FAIL optimization shape: add ${normal_add_count}->${opt_add_count}, mul ${normal_mul_count}->${opt_mul_count}" >&2
+    exit 1
+fi
+echo "PASS optimization shape: add ${normal_add_count}->${opt_add_count}, mul ${normal_mul_count}->${opt_mul_count}"

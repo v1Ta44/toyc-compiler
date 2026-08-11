@@ -1,8 +1,8 @@
 .text
 .globl main
 factorial:
-  addi sp, sp, -80
-  sw ra, 76(sp)
+  addi sp, sp, -64
+  sw ra, 60(sp)
   sw a0, 0(sp)
   lw t0, 0(sp)
   sw t0, 4(sp)
@@ -17,8 +17,8 @@ factorial:
   beqz t0, .L4
   li t0, 1
   mv a0, t0
-  lw ra, 76(sp)
-  addi sp, sp, 80
+  lw ra, 60(sp)
+  addi sp, sp, 64
   ret
 .L4:
   lw t0, 0(sp)
@@ -38,29 +38,29 @@ factorial:
   lw t1, 16(sp)
   lw t2, 32(sp)
   mul t0, t1, t2
-  sw t0, 40(sp)
-  lw t1, 40(sp)
+  sw t0, 36(sp)
+  lw t1, 36(sp)
   mv t0, t1
   mv a0, t0
-  lw ra, 76(sp)
-  addi sp, sp, 80
+  lw ra, 60(sp)
+  addi sp, sp, 64
   ret
 main:
-  addi sp, sp, -80
-  sw ra, 76(sp)
+  addi sp, sp, -64
+  sw ra, 60(sp)
   li t0, 5
-  sw t0, 44(sp)
-  lw t0, 44(sp)
+  sw t0, 40(sp)
+  lw t0, 40(sp)
   mv a0, t0
   call factorial
-  sw a0, 48(sp)
+  sw a0, 44(sp)
+  lw t0, 44(sp)
+  sw t0, 48(sp)
   lw t0, 48(sp)
-  sw t0, 56(sp)
-  lw t0, 56(sp)
-  sw t0, 60(sp)
-  lw t1, 60(sp)
+  sw t0, 52(sp)
+  lw t1, 52(sp)
   mv t0, t1
   mv a0, t0
-  lw ra, 76(sp)
-  addi sp, sp, 80
+  lw ra, 60(sp)
+  addi sp, sp, 64
   ret

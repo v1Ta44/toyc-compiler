@@ -5,8 +5,8 @@ global:
 .text
 .globl main
 main:
-  addi sp, sp, -144
-  sw ra, 140(sp)
+  addi sp, sp, -128
+  sw ra, 124(sp)
   li t0, 0
   sw t0, 0(sp)
   lw t0, 0(sp)
@@ -125,6 +125,6 @@ main:
   lw t1, 112(sp)
   mv t0, t1
   mv a0, t0
-  lw ra, 140(sp)
-  addi sp, sp, 144
+  lw ra, 124(sp)
+  addi sp, sp, 128
   ret

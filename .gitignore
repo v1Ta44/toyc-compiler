@@ -1,3 +1,6 @@
 # CMake 和端到端测试产生的临时构建目录；tests/generated 下的目标汇编仍纳入仓库。
 /build/
 /build-wsl/
+
+# Codex 本地交接上下文，不纳入版本库。
+/agents.md

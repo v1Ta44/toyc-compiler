@@ -1,0 +1,14 @@
+int identity(int value) {
+  return value;
+}
+
+int main() {
+  int a = 4;
+  int b = 7;
+  int first = (a + b) * (a + b);
+  int duplicate = (a + b) * (a + b);
+  a = a + 1;
+  int second = (a + b) * (a + b);
+  int carried = first + duplicate + identity(second);
+  return carried == 386;
+}

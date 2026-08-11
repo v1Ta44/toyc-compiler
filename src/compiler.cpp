@@ -1,7 +1,9 @@
 #include "compiler.hpp"
 #include <algorithm>
+#include <array>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 namespace toyc {
 // 由 Bison 填充，main 在解析完成后把它交给后端。
 Program *g_program = nullptr;
@@ -34,6 +36,187 @@ class Generator {
     std::vector<std::pair<std::string, int>> data_;
     int next_ = 0;
     bool opt_;
+
+    // 将 Call IR 中的逗号分隔参数转换为列表。
+    static std::vector<std::string> callArgs(const std::string &text) {
+        std::stringstream ss(text);
+        std::string arg;
+        std::vector<std::string> result;
+        while (std::getline(ss, arg, ','))
+            if (!arg.empty())
+                result.push_back(arg);
+        return result;
+    }
+
+    static std::string joinArgs(const std::vector<std::string> &args) {
+        std::string result;
+        for (const auto &arg : args)
+            result += arg + ",";
+        return result;
+    }
+
+    // 基本块内局部值编号：同时复用未失效的 Load 和二元表达式。
+    void eliminateCommonSubexpressions() {
+        std::vector<IR> result;
+        std::unordered_map<std::string, std::string> available;
+        std::unordered_map<std::string, std::string> alias;
+        const std::unordered_set<std::string> commutative = {"+", "*", "==", "!="};
+
+        auto resolve = [&](std::string value) {
+            std::unordered_set<std::string> seen;
+            while (alias.contains(value) && !seen.contains(value)) {
+                seen.insert(value);
+                value = alias[value];
+            }
+            return value;
+        };
+        auto clearBlock = [&] {
+            available.clear();
+            alias.clear();
+        };
+        auto forgetResult = [&](const std::string &value) {
+            alias.erase(value);
+            for (auto it = available.begin(); it != available.end();) {
+                if (it->second == value)
+                    it = available.erase(it);
+                else
+                    ++it;
+            }
+        };
+
+        for (auto ins : ir_) {
+            if (ins.op == IR::Label) {
+                clearBlock();
+                result.push_back(std::move(ins));
+                continue;
+            }
+
+            if (ins.op == IR::Mov)
+                ins.y = resolve(ins.y);
+            else if (ins.op == IR::Bin) {
+                ins.y = resolve(ins.y);
+                ins.z = resolve(ins.z);
+            } else if (ins.op == IR::Store)
+                ins.y = resolve(ins.y);
+            else if (ins.op == IR::BrZ)
+                ins.x = resolve(ins.x);
+            else if (ins.op == IR::Call) {
+                auto args = callArgs(ins.y);
+                for (auto &arg : args)
+                    arg = resolve(arg);
+                ins.y = joinArgs(args);
+            }
+
+            if (ins.op == IR::Load) {
+                forgetResult(ins.x);
+                const std::string key = "load\n" + ins.y;
+                if (auto found = available.find(key); found != available.end()) {
+                    alias[ins.x] = resolve(found->second);
+                    continue;
+                }
+                available[key] = ins.x;
+            } else if (ins.op == IR::Bin) {
+                forgetResult(ins.x);
+                std::string left = ins.y, right = ins.z;
+                if (commutative.contains(ins.aux) && right < left)
+                    std::swap(left, right);
+                const std::string key = "bin\n" + ins.aux + "\n" + left + "\n" + right;
+                if (auto found = available.find(key); found != available.end()) {
+                    alias[ins.x] = resolve(found->second);
+                    continue;
+                }
+                available[key] = ins.x;
+            } else if (ins.op == IR::Mov || ins.op == IR::Call)
+                forgetResult(ins.x);
+
+            if (ins.op == IR::Store)
+                available.erase("load\n" + ins.x);
+            if (ins.op == IR::Call) {
+                // 调用可能改写全局内存，因此丢弃全部 Load 记录。
+                for (auto it = available.begin(); it != available.end();) {
+                    if (it->first.rfind("load\n", 0) == 0)
+                        it = available.erase(it);
+                    else
+                        ++it;
+                }
+            }
+
+            result.push_back(std::move(ins));
+            if (result.back().op == IR::Jump || result.back().op == IR::BrZ ||
+                result.back().op == IR::Ret)
+                clearBlock();
+        }
+        ir_ = std::move(result);
+    }
+
+    // 线性扫描分配 s1-s11；寄存器不足的临时量保留在栈中。
+    std::unordered_map<std::string, std::string> allocateRegisters() const {
+        struct Interval {
+            std::string value;
+            int begin;
+            int end;
+        };
+        std::unordered_map<std::string, std::pair<int, int>> ranges;
+        auto touch = [&](const std::string &value, int position) {
+            if (value.empty() || value[0] != 't')
+                return;
+            auto [it, inserted] = ranges.emplace(value, std::pair{position, position});
+            if (!inserted)
+                it->second.second = position;
+        };
+        for (int position = 0; position < static_cast<int>(ir_.size()); ++position) {
+            const auto &ins = ir_[position];
+            if (ins.op == IR::Mov) {
+                touch(ins.x, position);
+                touch(ins.y, position);
+            } else if (ins.op == IR::Bin) {
+                touch(ins.x, position);
+                touch(ins.y, position);
+                touch(ins.z, position);
+            } else if (ins.op == IR::Load)
+                touch(ins.x, position);
+            else if (ins.op == IR::Store || ins.op == IR::BrZ)
+                touch(ins.op == IR::Store ? ins.y : ins.x, position);
+            else if (ins.op == IR::Call) {
+                touch(ins.x, position);
+                for (const auto &arg : callArgs(ins.y))
+                    touch(arg, position);
+            }
+        }
+
+        std::vector<Interval> intervals;
+        for (const auto &[value, range] : ranges)
+            intervals.push_back({value, range.first, range.second});
+        std::sort(intervals.begin(), intervals.end(), [](const auto &a, const auto &b) {
+            return a.begin < b.begin;
+        });
+
+        const std::array<std::string, 11> registers = {"s1", "s2", "s3", "s4", "s5", "s6",
+                                                       "s7", "s8", "s9", "s10", "s11"};
+        struct Active {
+            int end;
+            std::string reg;
+        };
+        std::vector<Active> active;
+        std::vector<std::string> free(registers.begin(), registers.end());
+        std::unordered_map<std::string, std::string> allocation;
+        for (const auto &interval : intervals) {
+            for (auto it = active.begin(); it != active.end();) {
+                if (it->end < interval.begin) {
+                    free.push_back(it->reg);
+                    it = active.erase(it);
+                } else
+                    ++it;
+            }
+            if (free.empty())
+                continue;
+            const std::string reg = free.back();
+            free.pop_back();
+            allocation[interval.value] = reg;
+            active.push_back({interval.end, reg});
+        }
+        return allocation;
+    }
 
     // 临时值和标签共享单调编号，确保整个编译单元内名称唯一。
     std::string tmp() {
@@ -303,6 +486,8 @@ class Generator {
                 emit({IR::Ret});
             scopes_.pop_back();
         }
+        if (opt_)
+            eliminateCommonSubexpressions();
     }
 
     // 为全部虚拟值分配栈槽，再逐条翻译为 RV32I/M 汇编文本。
@@ -313,15 +498,44 @@ class Generator {
                 o << ".globl " << n << "\n" << n << ":\n  .word " << v << "\n";
         }
         o << ".text\n";
+        auto allocation = opt_ ? allocateRegisters() : std::unordered_map<std::string, std::string>{};
+        std::unordered_set<std::string> savedSet;
+        for (const auto &[value, reg] : allocation)
+            savedSet.insert(reg);
+        std::vector<std::string> saved(savedSet.begin(), savedSet.end());
+        std::sort(saved.begin(), saved.end());
+
         std::unordered_map<std::string, int> slot;
         int n = 0;
         // t* 是表达式临时量，@* 是局部变量/形参槽位；二者都落在当前栈帧。
-        for (auto &i : ir_)
-            for (auto *s : {&i.x, &i.y, &i.z})
-                if (!s->empty() && ((*s)[0] == 't' || (*s)[0] == '@') && !slot.contains(*s))
-                    slot[*s] = n++;
-        n = ((((n + 4) * 4) + 15) & ~15) / 4 - 4;
-        int frame = (n + 4) * 4;
+        auto addSlot = [&](const std::string &value) {
+            if (!value.empty() && (value[0] == '@' || (value[0] == 't' && !allocation.contains(value))) &&
+                !slot.contains(value))
+                slot[value] = n++;
+        };
+        for (const auto &i : ir_) {
+            if (i.op == IR::Mov) {
+                addSlot(i.x);
+                addSlot(i.y);
+            } else if (i.op == IR::Bin) {
+                addSlot(i.x);
+                addSlot(i.y);
+                addSlot(i.z);
+            } else if (i.op == IR::Load) {
+                addSlot(i.x);
+                addSlot(i.y);
+            } else if (i.op == IR::Store) {
+                addSlot(i.x);
+                addSlot(i.y);
+            } else if (i.op == IR::Call) {
+                addSlot(i.x);
+                for (const auto &arg : callArgs(i.y))
+                    addSlot(arg);
+            } else if (i.op == IR::BrZ)
+                addSlot(i.x);
+        }
+        int frame = ((n + 1 + static_cast<int>(saved.size())) * 4 + 15) & ~15;
+        int raOffset = frame - 4;
         // 栈帧按 ABI 要求对齐到 16 字节，并预留保存 ra 的位置。
         o << ".globl main\n";
         for (auto &i : ir_) {
@@ -330,6 +544,8 @@ class Generator {
                 if (s.empty())
                     return std::string(r);
                 if (s[0] == 't') {
+                    if (auto found = allocation.find(s); found != allocation.end())
+                        return found->second;
                     o << "  lw " << r << ", " << (slot[s] * 4) << "(sp)\n";
                     return std::string(r);
                 }
@@ -341,8 +557,13 @@ class Generator {
             };
             auto put = [&](const std::string &s, const char *r) {
                 // 临时量写回栈槽，a0 等真实寄存器则直接使用 mv。
-                if (!s.empty() && s[0] == 't')
-                    o << "  sw " << r << ", " << (slot[s] * 4) << "(sp)\n";
+                if (!s.empty() && s[0] == 't') {
+                    if (auto found = allocation.find(s); found != allocation.end()) {
+                        if (found->second != r)
+                            o << "  mv " << found->second << ", " << r << "\n";
+                    } else
+                        o << "  sw " << r << ", " << (slot[s] * 4) << "(sp)\n";
+                }
                 else if (!s.empty())
                     o << "  mv " << s << ", " << r << "\n";
             };
@@ -350,9 +571,12 @@ class Generator {
             case IR::Label:
                 // 函数标签需要序言；以 . 开头的局部控制流标签不创建新栈帧。
                 o << i.x << ":\n";
-                if (i.x != "" && i.x[0] != '.')
-                    o << "  addi sp, sp, -" << ((n + 4) * 4) << "\n  sw ra, " << ((n + 3) * 4)
-                      << "(sp)\n";
+                if (i.x != "" && i.x[0] != '.') {
+                    o << "  addi sp, sp, -" << frame << "\n  sw ra, " << raOffset << "(sp)\n";
+                    for (size_t k = 0; k < saved.size(); ++k)
+                        o << "  sw " << saved[k] << ", " << (raOffset - 4 - static_cast<int>(k) * 4)
+                          << "(sp)\n";
+                }
                 break;
             case IR::Mov:
                 if (i.y.empty())
@@ -393,12 +617,7 @@ class Generator {
             }
             case IR::Call: {
                 // 前八个实参进入 a0-a7，额外实参在调用前压入 16 字节对齐的区域。
-                std::stringstream ss(i.y);
-                std::string a;
-                std::vector<std::string> av;
-                while (std::getline(ss, a, ','))
-                    if (!a.empty())
-                        av.push_back(a);
+                auto av = callArgs(i.y);
                 int extra = av.size() > 8 ? ((int(av.size() - 8) * 4 + 15) & ~15) : 0;
                 for (size_t k = 0; k < av.size(); ++k) {
                     auto q = reg(av[k], "t0");
@@ -435,8 +654,11 @@ class Generator {
                 o << "  j " << i.x << "\n";
                 break;
             case IR::Ret:
+                for (size_t k = 0; k < saved.size(); ++k)
+                    o << "  lw " << saved[k] << ", " << (raOffset - 4 - static_cast<int>(k) * 4)
+                      << "(sp)\n";
                 // 统一恢复返回地址和栈指针，然后交还控制权。
-                o << "  lw ra, " << ((n + 3) * 4) << "(sp)\n  addi sp, sp, " << ((n + 4) * 4)
+                o << "  lw ra, " << raOffset << "(sp)\n  addi sp, sp, " << frame
                   << "\n  ret\n";
                 break;
             case IR::Load:

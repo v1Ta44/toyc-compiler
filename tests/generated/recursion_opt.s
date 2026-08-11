@@ -1,66 +1,67 @@
 .text
 .globl main
 factorial:
-  addi sp, sp, -80
-  sw ra, 76(sp)
+  addi sp, sp, -32
+  sw ra, 28(sp)
+  sw s10, 24(sp)
+  sw s11, 20(sp)
+  sw s9, 16(sp)
   sw a0, 0(sp)
   lw t0, 0(sp)
-  sw t0, 4(sp)
+  mv s11, t0
   li t0, 1
-  sw t0, 8(sp)
-  lw t1, 4(sp)
-  lw t2, 8(sp)
-  slt t0, t2, t1
+  mv s10, t0
+  slt t0, s10, s11
   xori t0, t0, 1
-  sw t0, 12(sp)
-  lw t0, 12(sp)
-  beqz t0, .L4
+  mv s9, t0
+  beqz s9, .L4
   li t0, 1
   mv a0, t0
-  lw ra, 76(sp)
-  addi sp, sp, 80
+  lw s10, 24(sp)
+  lw s11, 20(sp)
+  lw s9, 16(sp)
+  lw ra, 28(sp)
+  addi sp, sp, 32
   ret
 .L4:
   lw t0, 0(sp)
-  sw t0, 16(sp)
-  lw t0, 0(sp)
-  sw t0, 20(sp)
+  mv s9, t0
   li t0, 1
-  sw t0, 24(sp)
-  lw t1, 20(sp)
-  lw t2, 24(sp)
-  sub t0, t1, t2
-  sw t0, 28(sp)
-  lw t0, 28(sp)
-  mv a0, t0
+  mv s10, t0
+  sub t0, s9, s10
+  mv s11, t0
+  mv a0, s11
   call factorial
-  sw a0, 32(sp)
-  lw t1, 16(sp)
-  lw t2, 32(sp)
-  mul t0, t1, t2
-  sw t0, 40(sp)
-  lw t1, 40(sp)
-  mv t0, t1
+  mv s10, a0
+  mul t0, s9, s10
+  mv s11, t0
+  mv t0, s11
   mv a0, t0
-  lw ra, 76(sp)
-  addi sp, sp, 80
+  lw s10, 24(sp)
+  lw s11, 20(sp)
+  lw s9, 16(sp)
+  lw ra, 28(sp)
+  addi sp, sp, 32
   ret
 main:
-  addi sp, sp, -80
-  sw ra, 76(sp)
+  addi sp, sp, -32
+  sw ra, 28(sp)
+  sw s10, 24(sp)
+  sw s11, 20(sp)
+  sw s9, 16(sp)
   li t0, 5
-  sw t0, 44(sp)
-  lw t0, 44(sp)
-  mv a0, t0
+  mv s11, t0
+  mv a0, s11
   call factorial
-  sw a0, 48(sp)
-  lw t0, 48(sp)
-  sw t0, 56(sp)
-  lw t0, 56(sp)
-  sw t0, 60(sp)
-  lw t1, 60(sp)
-  mv t0, t1
+  mv s10, a0
+  sw s10, 4(sp)
+  lw t0, 4(sp)
+  mv s10, t0
+  mv t0, s10
   mv a0, t0
-  lw ra, 76(sp)
-  addi sp, sp, 80
+  lw s10, 24(sp)
+  lw s11, 20(sp)
+  lw s9, 16(sp)
+  lw ra, 28(sp)
+  addi sp, sp, 32
   ret

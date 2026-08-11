@@ -55,8 +55,11 @@ PASS control_flow: exit=1
 PASS control_flow_opt: exit=1
 ```
 
-`-opt` enables removal of branches with compile-time-known conditions. Constant
-expressions are folded during lowering in both modes.
+`-opt` enables removal of branches with compile-time-known conditions, local
+common-subexpression elimination, and linear-scan register allocation. The CSE
+pass respects stores, calls, and basic-block boundaries. Register allocation
+uses the callee-saved `s1`-`s11` registers and spills excess live values to the
+stack. Constant expressions are folded during lowering in both modes.
 
 The output uses the RV32I/M integer instruction set. Calls use `a0`-`a7` for
 the first eight integer arguments and stack-passed arguments thereafter.
