@@ -55,6 +55,92 @@ class Generator {
         return result;
     }
 
+    // 代数化简、无用临时量删除和相邻跳转清理，均只处理无副作用 IR。
+    void simplifyIR() {
+        auto isTemp = [](const std::string &v) { return !v.empty() && v[0] == 't'; };
+        auto isZero = [](const std::string &v) { return v == "0"; };
+        auto isOne = [](const std::string &v) { return v == "1"; };
+
+        for (auto &ins : ir_) {
+            if (ins.op != IR::Bin)
+                continue;
+            // x + 0, x - 0, x * 1, x / 1 等恒等式直接变为拷贝。
+            if ((ins.aux == "+" || ins.aux == "-") && isZero(ins.z)) {
+                ins.op = IR::Mov;
+                ins.z.clear();
+                ins.aux.clear();
+            } else if ((ins.aux == "+") && isZero(ins.y)) {
+                ins.op = IR::Mov;
+                ins.y = ins.z;
+                ins.z.clear();
+                ins.aux.clear();
+            } else if ((ins.aux == "*" || ins.aux == "/") && isOne(ins.z)) {
+                ins.op = IR::Mov;
+                ins.z.clear();
+                ins.aux.clear();
+            } else if (ins.aux == "*" && isOne(ins.y)) {
+                ins.op = IR::Mov;
+                ins.y = ins.z;
+                ins.z.clear();
+                ins.aux.clear();
+            } else if (ins.aux == "*" && (isZero(ins.y) || isZero(ins.z))) {
+                ins.op = IR::Mov;
+                ins.y.clear();
+                ins.z.clear();
+                ins.aux.clear();
+                ins.imm = 0;
+            }
+        }
+
+        // 统计所有临时量的使用次数；删除结果完全未被使用的纯指令。
+        std::unordered_map<std::string, int> uses;
+        auto use = [&](const std::string &v) {
+            if (isTemp(v))
+                ++uses[v];
+        };
+        std::vector<IR> live = ir_;
+        // 删除一条指令可能使其输入也变成死值，因此重复扫描直到达到不动点。
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            uses.clear();
+            for (const auto &ins : live) {
+                if (ins.op == IR::Mov)
+                    use(ins.y);
+                else if (ins.op == IR::Bin) {
+                    use(ins.y);
+                    use(ins.z);
+                } else if (ins.op == IR::Store)
+                    use(ins.y);
+                else if (ins.op == IR::BrZ)
+                    use(ins.x);
+                else if (ins.op == IR::Load)
+                    use(ins.y);
+                else if (ins.op == IR::Call)
+                    for (const auto &arg : callArgs(ins.y))
+                        use(arg);
+            }
+            std::vector<IR> next;
+            for (const auto &ins : live) {
+                const bool pure = ins.op == IR::Mov || ins.op == IR::Bin || ins.op == IR::Load;
+                if (pure && isTemp(ins.x) && uses[ins.x] == 0) {
+                    changed = true;
+                    continue;
+                }
+                next.push_back(ins);
+            }
+            live = std::move(next);
+        }
+        std::vector<IR> compact;
+        for (size_t i = 0; i < live.size(); ++i) {
+            if (live[i].op == IR::Jump && i + 1 < live.size() &&
+                live[i + 1].op == IR::Label && live[i].x == live[i + 1].x)
+                continue;
+            compact.push_back(std::move(live[i]));
+        }
+        ir_ = std::move(compact);
+    }
+
     // 基本块内局部值编号：同时复用未失效的 Load 和二元表达式。
     void eliminateCommonSubexpressions() {
         std::vector<IR> result;
@@ -488,6 +574,8 @@ class Generator {
         }
         if (opt_)
             eliminateCommonSubexpressions();
+        if (opt_)
+            simplifyIR();
     }
 
     // 为全部虚拟值分配栈槽，再逐条翻译为 RV32I/M 汇编文本。
