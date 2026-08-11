@@ -45,6 +45,65 @@ run_case() {
     echo "PASS ${case_name}${suffix}: exit=${actual}"
 }
 
+# 动态生成极端规模源码，避免在仓库中保存数千行机械测试数据。
+generate_codegen_limits() {
+    printf '%s\n' 'int main() { int x = 3; return -x; }'
+}
+
+generate_large_stack() {
+    printf 'int main() {'
+    for i in $(seq 0 799); do
+        printf ' int v%s = %s;' "${i}" "${i}"
+    done
+    printf ' return v799 - v0; }\n'
+}
+
+generate_many_arguments() {
+    printf 'int last('
+    for i in $(seq 0 599); do
+        if (( i != 0 )); then
+            printf ','
+        fi
+        printf 'int p%s' "${i}"
+    done
+    printf ') { return p599; } int main() { return last('
+    for i in $(seq 0 599); do
+        if (( i != 0 )); then
+            printf ','
+        fi
+        printf '%s' "${i}"
+    done
+    printf '); }\n'
+}
+
+run_generated_case() {
+    local case_name="$1"
+    local expected="$2"
+    local mode="$3"
+    local option=()
+    if [[ "${mode}" == "opt" ]]; then
+        option=(-opt)
+    fi
+
+    local source="${binary_dir}/${case_name}.tc"
+    local assembly="${binary_dir}/${case_name}_${mode}.s"
+    local binary="${binary_dir}/${case_name}_${mode}"
+    "generate_${case_name}" > "${source}"
+    "${build_dir}/toyc_compiler" "${option[@]}" < "${source}" > "${assembly}"
+    riscv64-linux-gnu-gcc -march=rv32im -mabi=ilp32 -nostdlib -static \
+        -Wl,-e,_start "${repo_dir}/tests/rv32_start.s" "${assembly}" -o "${binary}"
+
+    set +e
+    qemu-riscv32 "${binary}"
+    local actual=$?
+    set -e
+    if [[ "${actual}" -ne "${expected}" ]]; then
+        echo "FAIL ${case_name}_${mode}: expected ${expected}, got ${actual}" >&2
+        return 1
+    fi
+    echo "PASS ${case_name}_${mode}: exit=${actual}"
+}
+
 run_case recursion 120 normal
 run_case recursion 120 opt
 run_case control_flow 1 normal
@@ -53,6 +112,12 @@ run_case optimizations 1 normal
 run_case optimizations 1 opt
 run_case register_pressure 78 normal
 run_case register_pressure 78 opt
+run_generated_case codegen_limits 253 normal
+run_generated_case codegen_limits 253 opt
+run_generated_case large_stack 31 normal
+run_generated_case large_stack 31 opt
+run_generated_case many_arguments 87 normal
+run_generated_case many_arguments 87 opt
 
 # 专用用例中有两组重复的加法和乘法；优化版应各只保留每组的一条指令。
 normal_mul_count="$(grep -c '^  mul ' "${generated_dir}/optimizations.s")"

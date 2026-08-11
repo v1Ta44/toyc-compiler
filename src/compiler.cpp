@@ -631,6 +631,19 @@ class Generator {
         }
         int frame = ((n + 1 + static_cast<int>(saved.size())) * 4 + 15) & ~15;
         int raOffset = frame - 4;
+        auto stackMemory = [&](const char *op, const std::string &reg, int offset) {
+            if (offset >= -2048 && offset <= 2047)
+                o << "  " << op << " " << reg << ", " << offset << "(sp)\n";
+            else
+                o << "  li t3, " << offset << "\n  add t3, sp, t3\n  " << op << " " << reg
+                  << ", 0(t3)\n";
+        };
+        auto adjustStack = [&](int amount) {
+            if (amount >= -2048 && amount <= 2047)
+                o << "  addi sp, sp, " << amount << "\n";
+            else
+                o << "  li t3, " << amount << "\n  add sp, sp, t3\n";
+        };
         // 栈帧按 ABI 要求对齐到 16 字节，并预留保存 ra 的位置。
         o << ".globl main\n";
         for (auto &i : ir_) {
@@ -638,14 +651,16 @@ class Generator {
                 // 把抽象操作数物化到寄存器；普通 ABI 寄存器名可直接返回。
                 if (s.empty())
                     return std::string(r);
+                if (s == "0")
+                    return std::string("zero");
                 if (s[0] == 't') {
                     if (auto found = allocation.find(s); found != allocation.end())
                         return found->second;
-                    o << "  lw " << r << ", " << (slot[s] * 4) << "(sp)\n";
+                    stackMemory("lw", r, slot[s] * 4);
                     return std::string(r);
                 }
                 if (s.rfind("arg", 0) == 0) {
-                    o << "  lw " << r << ", " << (frame + std::stoi(s.substr(3)) * 4) << "(sp)\n";
+                    stackMemory("lw", r, frame + std::stoi(s.substr(3)) * 4);
                     return std::string(r);
                 }
                 return s;
@@ -657,7 +672,7 @@ class Generator {
                         if (found->second != r)
                             o << "  mv " << found->second << ", " << r << "\n";
                     } else
-                        o << "  sw " << r << ", " << (slot[s] * 4) << "(sp)\n";
+                        stackMemory("sw", r, slot[s] * 4);
                 }
                 else if (!s.empty())
                     o << "  mv " << s << ", " << r << "\n";
@@ -667,10 +682,11 @@ class Generator {
                 // 函数标签需要序言；以 . 开头的局部控制流标签不创建新栈帧。
                 o << i.x << ":\n";
                 if (i.x != "" && i.x[0] != '.') {
-                    o << "  addi sp, sp, -" << frame << "\n  sw ra, " << raOffset << "(sp)\n";
+                    adjustStack(-frame);
+                    stackMemory("sw", "ra", raOffset);
                     for (size_t k = 0; k < saved.size(); ++k)
-                        o << "  sw " << saved[k] << ", " << (raOffset - 4 - static_cast<int>(k) * 4)
-                          << "(sp)\n";
+                        stackMemory("sw", saved[k],
+                                    raOffset - 4 - static_cast<int>(k) * 4);
                 }
                 break;
             case IR::Mov:
@@ -719,13 +735,13 @@ class Generator {
                     if (k < 8)
                         o << "  mv a" << k << ", " << q << "\n";
                     else
-                        o << "  sw " << q << ", " << (-extra + int(k - 8) * 4) << "(sp)\n";
+                        stackMemory("sw", q, -extra + int(k - 8) * 4);
                 }
                 if (extra)
-                    o << "  addi sp, sp, -" << extra << "\n";
+                    adjustStack(-extra);
                 o << "  call " << i.aux << "\n";
                 if (extra)
-                    o << "  addi sp, sp, " << extra << "\n";
+                    adjustStack(extra);
                 put(i.x, "a0");
                 break;
             }
@@ -737,7 +753,7 @@ class Generator {
                     o << "  sw " << q << ", 0(t1)\n";
                 } else {
                     auto q = reg(i.y, "t0");
-                    o << "  sw " << q << ", " << (slot[i.x] * 4) << "(sp)\n";
+                    stackMemory("sw", q, slot[i.x] * 4);
                 }
                 break;
             case IR::BrZ: {
@@ -750,18 +766,19 @@ class Generator {
                 break;
             case IR::Ret:
                 for (size_t k = 0; k < saved.size(); ++k)
-                    o << "  lw " << saved[k] << ", " << (raOffset - 4 - static_cast<int>(k) * 4)
-                      << "(sp)\n";
+                    stackMemory("lw", saved[k],
+                                raOffset - 4 - static_cast<int>(k) * 4);
                 // 统一恢复返回地址和栈指针，然后交还控制权。
-                o << "  lw ra, " << raOffset << "(sp)\n  addi sp, sp, " << frame
-                  << "\n  ret\n";
+                stackMemory("lw", "ra", raOffset);
+                adjustStack(frame);
+                o << "  ret\n";
                 break;
             case IR::Load:
                 // 全局变量经 la 获得地址，局部值直接按 sp 偏移读取。
                 if (i.y[0] == '$') {
                     o << "  la t1, " << i.y.substr(1) << "\n  lw t0, 0(t1)\n";
                 } else
-                    o << "  lw t0, " << (slot[i.y] * 4) << "(sp)\n";
+                    stackMemory("lw", "t0", slot[i.y] * 4);
                 put(i.x, "t0");
                 break;
             }
