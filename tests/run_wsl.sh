@@ -112,6 +112,8 @@ run_case optimizations 1 normal
 run_case optimizations 1 opt
 run_case register_pressure 78 normal
 run_case register_pressure 78 opt
+run_case complex_semantics 1 normal
+run_case complex_semantics 1 opt
 run_generated_case codegen_limits 253 normal
 run_generated_case codegen_limits 253 opt
 run_generated_case large_stack 31 normal
@@ -129,3 +131,22 @@ if (( opt_mul_count >= normal_mul_count || opt_add_count >= normal_add_count ));
     exit 1
 fi
 echo "PASS optimization shape: add ${normal_add_count}->${opt_add_count}, mul ${normal_mul_count}->${opt_mul_count}"
+
+# 核心用例的优化版必须减少静态指令数；控制流热路径还要求显著降低访存和搬运。
+for case_name in recursion control_flow optimizations register_pressure complex_semantics; do
+    normal_instruction_count="$(grep -c '^  ' "${generated_dir}/${case_name}.s")"
+    opt_instruction_count="$(grep -c '^  ' "${generated_dir}/${case_name}_opt.s")"
+    if (( opt_instruction_count >= normal_instruction_count )); then
+        echo "FAIL instruction count ${case_name}: ${normal_instruction_count}->${opt_instruction_count}" >&2
+        exit 1
+    fi
+    echo "PASS instruction count ${case_name}: ${normal_instruction_count}->${opt_instruction_count}"
+done
+
+normal_move_count="$(grep -Ec '^  (lw|sw|mv) ' "${generated_dir}/control_flow.s")"
+opt_move_count="$(grep -Ec '^  (lw|sw|mv) ' "${generated_dir}/control_flow_opt.s")"
+if (( opt_move_count * 2 >= normal_move_count )); then
+    echo "FAIL control-flow data movement: ${normal_move_count}->${opt_move_count}" >&2
+    exit 1
+fi
+echo "PASS control-flow data movement: ${normal_move_count}->${opt_move_count}"

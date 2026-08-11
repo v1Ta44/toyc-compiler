@@ -27,7 +27,8 @@ int yylex(yy::parser::semantic_type *);
 
 %left OROR
 %left ANDAND
-%left EQ NE '<' '>' LE GE
+%left EQ NE
+%left '<' '>' LE GE
 %left '+' '-'
 %left '*' '/' '%'
 %right UPLUS UMINUS '!'

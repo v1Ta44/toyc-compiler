@@ -1,9 +1,11 @@
 #include "compiler.hpp"
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
+#include <utility>
 namespace toyc {
 // 由 Bison 填充，main 在解析完成后把它交给后端。
 Program *g_program = nullptr;
@@ -21,6 +23,11 @@ struct IR {
     Op op;
     std::string x, y, z, aux;
     int imm{};
+    IR(Op operation, std::string target = {}, std::string left = {}, std::string right = {},
+       std::string extra = {}, int immediate = 0)
+        : op(operation), x(std::move(target)), y(std::move(left)), z(std::move(right)),
+          aux(std::move(extra)), imm(immediate) {
+    }
 };
 
 // Generator 同时负责 AST -> IR 的降低和 IR -> RV32 的线性代码生成。
@@ -55,13 +62,146 @@ class Generator {
         return result;
     }
 
+    static bool isVirtual(const std::string &value) {
+        return !value.empty() && (value[0] == 't' || value[0] == '@');
+    }
+
+    static std::unordered_map<std::string, int> immediateConstants(const std::vector<IR> &code) {
+        std::unordered_map<std::string, int> constants;
+        std::unordered_map<std::string, int> definitions;
+        for (const auto &ins : code) {
+            const bool defines = !ins.x.empty() && ins.x[0] == 't' &&
+                                 (ins.op == IR::Mov || ins.op == IR::Bin || ins.op == IR::Load ||
+                                  ins.op == IR::Call);
+            if (!defines)
+                continue;
+            if (++definitions[ins.x] == 1 && ins.op == IR::Mov && ins.y.empty())
+                constants[ins.x] = ins.imm;
+            else
+                constants.erase(ins.x);
+        }
+        return constants;
+    }
+
+    // 局部变量和形参没有地址逃逸，可直接提升为可分配的虚拟寄存器。
+    void promoteLocalSlots() {
+        for (auto &ins : ir_) {
+            if (ins.op == IR::Load && !ins.y.empty() && ins.y[0] == '@') {
+                ins.op = IR::Mov;
+            } else if (ins.op == IR::Store && !ins.x.empty() && ins.x[0] == '@') {
+                ins.op = IR::Mov;
+            }
+        }
+    }
+
+    // 把常量条件分支转换为确定跳转，并按函数 CFG 删除不可达指令。
+    void simplifyControlFlow() {
+        const auto constants = immediateConstants(ir_);
+        std::vector<IR> folded;
+        for (auto ins : ir_) {
+            if (ins.op == IR::BrZ) {
+                if (auto found = constants.find(ins.x); found != constants.end()) {
+                    if (found->second == 0)
+                        folded.push_back({IR::Jump, ins.y});
+                    continue;
+                }
+            }
+            folded.push_back(std::move(ins));
+        }
+        ir_ = std::move(folded);
+
+        std::vector<IR> reachable;
+        for (size_t begin = 0; begin < ir_.size();) {
+            size_t end = begin + 1;
+            while (end < ir_.size() &&
+                   !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
+                ++end;
+
+            std::unordered_map<std::string, size_t> labels;
+            for (size_t i = begin; i < end; ++i)
+                if (ir_[i].op == IR::Label)
+                    labels[ir_[i].x] = i;
+            std::vector<bool> seen(end - begin);
+            std::vector<size_t> work = {begin};
+            while (!work.empty()) {
+                size_t i = work.back();
+                work.pop_back();
+                if (i < begin || i >= end || seen[i - begin])
+                    continue;
+                seen[i - begin] = true;
+                const auto &ins = ir_[i];
+                if (ins.op == IR::Jump) {
+                    if (auto target = labels.find(ins.x); target != labels.end())
+                        work.push_back(target->second);
+                } else if (ins.op == IR::BrZ) {
+                    if (auto target = labels.find(ins.y); target != labels.end())
+                        work.push_back(target->second);
+                    work.push_back(i + 1);
+                } else if (ins.op != IR::Ret) {
+                    work.push_back(i + 1);
+                }
+            }
+            for (size_t i = begin; i < end; ++i)
+                if (seen[i - begin])
+                    reachable.push_back(std::move(ir_[i]));
+            begin = end;
+        }
+        ir_ = std::move(reachable);
+    }
+
+    // 将唯一使用的临时结果直接写入紧随其后的最终目标，消除中间 Mov。
+    void coalesceAdjacentMoves() {
+        std::unordered_map<std::string, int> definitions, uses;
+        auto define = [&](const std::string &value) {
+            if (!value.empty() && value[0] == 't')
+                ++definitions[value];
+        };
+        auto use = [&](const std::string &value) {
+            if (!value.empty() && value[0] == 't')
+                ++uses[value];
+        };
+        for (const auto &ins : ir_) {
+            if (ins.op == IR::Mov) {
+                define(ins.x);
+                use(ins.y);
+            } else if (ins.op == IR::Bin) {
+                define(ins.x);
+                use(ins.y);
+                use(ins.z);
+            } else if (ins.op == IR::Load) {
+                define(ins.x);
+                use(ins.y);
+            } else if (ins.op == IR::Store) {
+                use(ins.y);
+            } else if (ins.op == IR::Call) {
+                define(ins.x);
+                for (const auto &arg : callArgs(ins.y))
+                    use(arg);
+            } else if (ins.op == IR::BrZ) {
+                use(ins.x);
+            }
+        }
+
+        std::vector<IR> result;
+        for (size_t i = 0; i < ir_.size(); ++i) {
+            IR ins = std::move(ir_[i]);
+            const bool definesValue =
+                ins.op == IR::Mov || ins.op == IR::Bin || ins.op == IR::Load || ins.op == IR::Call;
+            if (definesValue && !ins.x.empty() && ins.x[0] == 't' && definitions[ins.x] == 1 &&
+                uses[ins.x] == 1 && i + 1 < ir_.size() && ir_[i + 1].op == IR::Mov &&
+                ir_[i + 1].y == ins.x) {
+                ins.x = ir_[i + 1].x;
+                ++i;
+            }
+            result.push_back(std::move(ins));
+        }
+        ir_ = std::move(result);
+    }
+
     // 代数化简、无用临时量删除和相邻跳转清理，均只处理无副作用 IR。
     void simplifyIR() {
         auto isTemp = [](const std::string &v) { return !v.empty() && v[0] == 't'; };
-        std::unordered_map<std::string, int> constants;
-        for (const auto &ins : ir_)
-            if (ins.op == IR::Mov && ins.y.empty() && isTemp(ins.x))
-                constants[ins.x] = ins.imm;
+        const auto constants = immediateConstants(ir_);
         auto isConstant = [&](const std::string &v, int expected) {
             auto found = constants.find(v);
             return found != constants.end() && found->second == expected;
@@ -89,8 +229,7 @@ class Generator {
                 ins.y = ins.z;
                 ins.z.clear();
                 ins.aux.clear();
-            } else if (ins.aux == "*" &&
-                       (isConstant(ins.y, 0) || isConstant(ins.z, 0))) {
+            } else if (ins.aux == "*" && (isConstant(ins.y, 0) || isConstant(ins.z, 0))) {
                 ins.op = IR::Mov;
                 ins.y.clear();
                 ins.z.clear();
@@ -140,8 +279,8 @@ class Generator {
         }
         std::vector<IR> compact;
         for (size_t i = 0; i < live.size(); ++i) {
-            if (live[i].op == IR::Jump && i + 1 < live.size() &&
-                live[i + 1].op == IR::Label && live[i].x == live[i + 1].x)
+            if (live[i].op == IR::Jump && i + 1 < live.size() && live[i + 1].op == IR::Label &&
+                live[i].x == live[i + 1].x)
                 continue;
             compact.push_back(std::move(live[i]));
         }
@@ -153,6 +292,7 @@ class Generator {
         std::vector<IR> result;
         std::unordered_map<std::string, std::string> available;
         std::unordered_map<std::string, std::string> alias;
+        std::unordered_map<std::string, int> version;
         const std::unordered_set<std::string> commutative = {"+", "*", "==", "!="};
 
         auto resolve = [&](std::string value) {
@@ -166,6 +306,11 @@ class Generator {
         auto clearBlock = [&] {
             available.clear();
             alias.clear();
+        };
+        auto numbered = [&](const std::string &value) {
+            if (!value.empty() && value[0] == '@')
+                return value + "#" + std::to_string(version[value]);
+            return value;
         };
         auto forgetResult = [&](const std::string &value) {
             alias.erase(value);
@@ -210,7 +355,7 @@ class Generator {
                 available[key] = ins.x;
             } else if (ins.op == IR::Bin) {
                 forgetResult(ins.x);
-                std::string left = ins.y, right = ins.z;
+                std::string left = numbered(ins.y), right = numbered(ins.z);
                 if (commutative.contains(ins.aux) && right < left)
                     std::swap(left, right);
                 const std::string key = "bin\n" + ins.aux + "\n" + left + "\n" + right;
@@ -219,8 +364,11 @@ class Generator {
                     continue;
                 }
                 available[key] = ins.x;
-            } else if (ins.op == IR::Mov || ins.op == IR::Call)
+            } else if (ins.op == IR::Mov || ins.op == IR::Call) {
                 forgetResult(ins.x);
+                if (!ins.x.empty() && ins.x[0] == '@')
+                    ++version[ins.x];
+            }
 
             if (ins.op == IR::Store)
                 available.erase("load\n" + ins.x);
@@ -242,8 +390,92 @@ class Generator {
         ir_ = std::move(result);
     }
 
-    // 线性扫描分配 s1-s11；寄存器不足的临时量保留在栈中。
-    std::unordered_map<std::string, std::string> allocateRegisters() const {
+    // 按函数执行调用感知的线性扫描：短生命周期优先 t4-t6，跨调用值使用 s1-s11。
+    static std::unordered_set<std::string> valuesLiveAcrossCalls(const std::vector<IR> &code) {
+        const size_t count = code.size();
+        std::unordered_map<std::string, size_t> labels;
+        for (size_t i = 0; i < count; ++i)
+            if (code[i].op == IR::Label)
+                labels[code[i].x] = i;
+
+        std::vector<std::unordered_set<std::string>> uses(count), defs(count), liveIn(count),
+            liveOut(count);
+        auto use = [&](size_t i, const std::string &value) {
+            if (isVirtual(value))
+                uses[i].insert(value);
+        };
+        auto define = [&](size_t i, const std::string &value) {
+            if (isVirtual(value))
+                defs[i].insert(value);
+        };
+        for (size_t i = 0; i < count; ++i) {
+            const auto &ins = code[i];
+            if (ins.op == IR::Mov) {
+                define(i, ins.x);
+                use(i, ins.y);
+            } else if (ins.op == IR::Bin) {
+                define(i, ins.x);
+                use(i, ins.y);
+                use(i, ins.z);
+            } else if (ins.op == IR::Load) {
+                define(i, ins.x);
+                use(i, ins.y);
+            } else if (ins.op == IR::Store) {
+                define(i, ins.x);
+                use(i, ins.y);
+            } else if (ins.op == IR::Call) {
+                define(i, ins.x);
+                for (const auto &arg : callArgs(ins.y))
+                    use(i, arg);
+            } else if (ins.op == IR::BrZ) {
+                use(i, ins.x);
+            }
+        }
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t reverse = count; reverse-- > 0;) {
+                std::unordered_set<std::string> out;
+                const auto &ins = code[reverse];
+                auto mergeSuccessor = [&](size_t successor) {
+                    if (successor < count)
+                        out.insert(liveIn[successor].begin(), liveIn[successor].end());
+                };
+                if (ins.op == IR::Jump) {
+                    if (auto target = labels.find(ins.x); target != labels.end())
+                        mergeSuccessor(target->second);
+                } else if (ins.op == IR::BrZ) {
+                    if (auto target = labels.find(ins.y); target != labels.end())
+                        mergeSuccessor(target->second);
+                    mergeSuccessor(reverse + 1);
+                } else if (ins.op != IR::Ret) {
+                    mergeSuccessor(reverse + 1);
+                }
+                auto in = uses[reverse];
+                for (const auto &value : out)
+                    if (!defs[reverse].contains(value))
+                        in.insert(value);
+                if (out != liveOut[reverse] || in != liveIn[reverse]) {
+                    liveOut[reverse] = std::move(out);
+                    liveIn[reverse] = std::move(in);
+                    changed = true;
+                }
+            }
+        }
+
+        std::unordered_set<std::string> result;
+        for (size_t i = 0; i < count; ++i)
+            if (code[i].op == IR::Call)
+                for (const auto &value : liveOut[i])
+                    if (value != code[i].x)
+                        result.insert(value);
+        return result;
+    }
+
+    std::unordered_map<std::string, std::string>
+    allocateRegisters(const std::vector<IR> &code,
+                      const std::unordered_map<std::string, int> &constants) const {
         struct Interval {
             std::string value;
             int begin;
@@ -251,14 +483,14 @@ class Generator {
         };
         std::unordered_map<std::string, std::pair<int, int>> ranges;
         auto touch = [&](const std::string &value, int position) {
-            if (value.empty() || value[0] != 't')
+            if (!isVirtual(value) || constants.contains(value))
                 return;
             auto [it, inserted] = ranges.emplace(value, std::pair{position, position});
             if (!inserted)
                 it->second.second = position;
         };
-        for (int position = 0; position < static_cast<int>(ir_.size()); ++position) {
-            const auto &ins = ir_[position];
+        for (int position = 0; position < static_cast<int>(code.size()); ++position) {
+            const auto &ins = code[position];
             if (ins.op == IR::Mov) {
                 touch(ins.x, position);
                 touch(ins.y, position);
@@ -280,31 +512,47 @@ class Generator {
         std::vector<Interval> intervals;
         for (const auto &[value, range] : ranges)
             intervals.push_back({value, range.first, range.second});
-        std::sort(intervals.begin(), intervals.end(), [](const auto &a, const auto &b) {
-            return a.begin < b.begin;
-        });
+        std::sort(intervals.begin(), intervals.end(),
+                  [](const auto &a, const auto &b) { return a.begin < b.begin; });
 
-        const std::array<std::string, 11> registers = {"s1", "s2", "s3", "s4", "s5", "s6",
-                                                       "s7", "s8", "s9", "s10", "s11"};
+        const std::array<std::string, 3> temporaries = {"t4", "t5", "t6"};
+        const std::array<std::string, 11> saved = {"s1", "s2", "s3", "s4",  "s5", "s6",
+                                                   "s7", "s8", "s9", "s10", "s11"};
         struct Active {
             int end;
             std::string reg;
         };
         std::vector<Active> active;
-        std::vector<std::string> free(registers.begin(), registers.end());
+        std::unordered_set<std::string> free;
+        free.insert(temporaries.begin(), temporaries.end());
+        free.insert(saved.begin(), saved.end());
         std::unordered_map<std::string, std::string> allocation;
+        const auto liveAcrossCalls = valuesLiveAcrossCalls(code);
         for (const auto &interval : intervals) {
             for (auto it = active.begin(); it != active.end();) {
                 if (it->end < interval.begin) {
-                    free.push_back(it->reg);
+                    free.insert(it->reg);
                     it = active.erase(it);
                 } else
                     ++it;
             }
-            if (free.empty())
+            const bool crossesCall = liveAcrossCalls.contains(interval.value);
+            std::string reg;
+            if (!crossesCall)
+                for (const auto &candidate : temporaries)
+                    if (free.contains(candidate)) {
+                        reg = candidate;
+                        break;
+                    }
+            if (reg.empty())
+                for (const auto &candidate : saved)
+                    if (free.contains(candidate)) {
+                        reg = candidate;
+                        break;
+                    }
+            if (reg.empty())
                 continue;
-            const std::string reg = free.back();
-            free.pop_back();
+            free.erase(reg);
             allocation[interval.value] = reg;
             active.push_back({interval.end, reg});
         }
@@ -369,6 +617,8 @@ class Generator {
             auto v = find(e->name);
             if (v.constant)
                 return v;
+            if (opt_ && !v.v.empty() && v.v[0] == '@')
+                return {false, 0, v.v};
             std::string t = tmp();
             emit({IR::Load, t, v.v});
             return {false, 0, t};
@@ -399,32 +649,40 @@ class Generator {
                     a.n = !a.n;
                 return a;
             }
+            if (e->op == "+")
+                return a;
             std::string t = tmp();
-            emit({IR::Bin, t, "0", a.v, e->op == "-" ? "-" : "!"});
+            emit({IR::Bin, t, "0", a.v, e->op});
             return {false, 0, t};
         }
         if (e->op == "&&" || e->op == "||") {
             // 逻辑运算不能简单转成普通二元指令，必须用分支保证右侧按需执行。
-            if (a.constant && ((e->op == "&&" && !a.n) || (e->op == "||" && a.n)))
-                return {true, e->op == "||", {}};
-            std::string av = a.constant ? tmp() : a.v;
-            if (a.constant)
-                emit({IR::Mov, av, {}, {}, {}, a.n});
-            std::string t = tmp(), done = label(), skip = label();
+            if (a.constant) {
+                if ((e->op == "&&" && !a.n) || (e->op == "||" && a.n))
+                    return {true, e->op == "||", {}};
+                auto b = ex(e->b.get());
+                if (b.constant)
+                    return {true, !!b.n, {}};
+                std::string t = tmp();
+                emit({IR::Bin, t, "0", b.v, "bool"});
+                return {false, 0, t};
+            }
+            std::string av = a.v;
+            std::string t = tmp(), done = label();
             emit({IR::Mov, t, {}, {}, {}, e->op == "||" ? 1 : 0});
-            if (e->op == "&&")
-                emit({IR::BrZ, av, skip});
-            else {
-                emit({IR::BrZ, av, skip});
+            if (e->op == "&&") {
+                emit({IR::BrZ, av, done});
+            } else {
+                std::string rhs = label();
+                emit({IR::BrZ, av, rhs});
                 emit({IR::Jump, done});
+                emit({IR::Label, rhs});
             }
             auto b = ex(e->b.get());
             std::string bv = b.constant ? tmp() : b.v;
             if (b.constant)
                 emit({IR::Mov, bv, {}, {}, {}, b.n});
-            emit({IR::Bin, t, "0", bv, "!"});
-            emit({IR::Jump, done});
-            emit({IR::Label, skip});
+            emit({IR::Bin, t, "0", bv, "bool"});
             emit({IR::Label, done});
             return {false, 0, t};
         }
@@ -579,209 +837,298 @@ class Generator {
                 emit({IR::Ret});
             scopes_.pop_back();
         }
-        if (opt_)
+        if (opt_) {
+            promoteLocalSlots();
             eliminateCommonSubexpressions();
-        if (opt_)
             simplifyIR();
+            simplifyControlFlow();
+            eliminateCommonSubexpressions();
+            simplifyIR();
+            coalesceAdjacentMoves();
+            simplifyIR();
+        }
     }
 
-    // 为全部虚拟值分配栈槽，再逐条翻译为 RV32I/M 汇编文本。
+    // 逐函数分配寄存器和栈帧，并直接把 IR 目标写入最终物理寄存器。
     void output(std::ostream &o) {
         if (!data_.empty()) {
             o << ".data\n";
             for (auto &[n, v] : data_)
                 o << ".globl " << n << "\n" << n << ":\n  .word " << v << "\n";
         }
-        o << ".text\n";
-        auto allocation = opt_ ? allocateRegisters() : std::unordered_map<std::string, std::string>{};
-        std::unordered_set<std::string> savedSet;
-        for (const auto &[value, reg] : allocation)
-            savedSet.insert(reg);
-        std::vector<std::string> saved(savedSet.begin(), savedSet.end());
-        std::sort(saved.begin(), saved.end());
+        o << ".text\n.globl main\n";
 
-        std::unordered_map<std::string, int> slot;
-        int n = 0;
-        // t* 是表达式临时量，@* 是局部变量/形参槽位；二者都落在当前栈帧。
-        auto addSlot = [&](const std::string &value) {
-            if (!value.empty() && (value[0] == '@' || (value[0] == 't' && !allocation.contains(value))) &&
-                !slot.contains(value))
-                slot[value] = n++;
-        };
-        for (const auto &i : ir_) {
-            if (i.op == IR::Mov) {
-                addSlot(i.x);
-                addSlot(i.y);
-            } else if (i.op == IR::Bin) {
-                addSlot(i.x);
-                addSlot(i.y);
-                addSlot(i.z);
-            } else if (i.op == IR::Load) {
-                addSlot(i.x);
-                addSlot(i.y);
-            } else if (i.op == IR::Store) {
-                addSlot(i.x);
-                addSlot(i.y);
-            } else if (i.op == IR::Call) {
-                addSlot(i.x);
-                for (const auto &arg : callArgs(i.y))
-                    addSlot(arg);
-            } else if (i.op == IR::BrZ)
-                addSlot(i.x);
-        }
-        int frame = ((n + 1 + static_cast<int>(saved.size())) * 4 + 15) & ~15;
-        int raOffset = frame - 4;
-        auto stackMemory = [&](const char *op, const std::string &reg, int offset) {
-            if (offset >= -2048 && offset <= 2047)
-                o << "  " << op << " " << reg << ", " << offset << "(sp)\n";
-            else
-                o << "  li t3, " << offset << "\n  add t3, sp, t3\n  " << op << " " << reg
-                  << ", 0(t3)\n";
-        };
-        auto adjustStack = [&](int amount) {
-            if (amount >= -2048 && amount <= 2047)
-                o << "  addi sp, sp, " << amount << "\n";
-            else
-                o << "  li t3, " << amount << "\n  add sp, sp, t3\n";
-        };
-        // 栈帧按 ABI 要求对齐到 16 字节，并预留保存 ra 的位置。
-        o << ".globl main\n";
-        for (auto &i : ir_) {
-            auto reg = [&](const std::string &s, const char *r) {
-                // 把抽象操作数物化到寄存器；普通 ABI 寄存器名可直接返回。
-                if (s.empty())
-                    return std::string(r);
-                if (s == "0")
+        for (size_t begin = 0; begin < ir_.size();) {
+            size_t end = begin + 1;
+            while (end < ir_.size() &&
+                   !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
+                ++end;
+            std::vector<IR> code(ir_.begin() + begin, ir_.begin() + end);
+            const auto constants = immediateConstants(code);
+            auto allocation = opt_ ? allocateRegisters(code, constants)
+                                   : std::unordered_map<std::string, std::string>{};
+            const bool hasCall = std::any_of(code.begin(), code.end(),
+                                             [](const IR &ins) { return ins.op == IR::Call; });
+            if (opt_ && !hasCall)
+                for (const auto &ins : code)
+                    if (ins.op == IR::Mov && !ins.x.empty() && ins.x[0] == '@' &&
+                        ins.y.size() == 2 && ins.y[0] == 'a' && ins.y[1] >= '0' && ins.y[1] <= '7')
+                        allocation[ins.x] = ins.y;
+
+            std::unordered_set<std::string> savedSet;
+            for (const auto &[value, reg] : allocation)
+                if (!reg.empty() && reg[0] == 's')
+                    savedSet.insert(reg);
+            std::vector<std::string> saved(savedSet.begin(), savedSet.end());
+            std::sort(saved.begin(), saved.end());
+
+            std::unordered_map<std::string, int> slot;
+            int slotCount = 0;
+            auto addSlot = [&](const std::string &value) {
+                if (isVirtual(value) && !allocation.contains(value) && !constants.contains(value) &&
+                    !slot.contains(value))
+                    slot[value] = slotCount++;
+            };
+            for (const auto &ins : code) {
+                addSlot(ins.x);
+                if (ins.op == IR::Mov || ins.op == IR::Bin || ins.op == IR::Load ||
+                    ins.op == IR::Store)
+                    addSlot(ins.y);
+                if (ins.op == IR::Bin)
+                    addSlot(ins.z);
+                if (ins.op == IR::Call)
+                    for (const auto &arg : callArgs(ins.y))
+                        addSlot(arg);
+                if (ins.op == IR::BrZ)
+                    addSlot(ins.x);
+            }
+
+            const int saveCount = static_cast<int>(saved.size()) + (hasCall ? 1 : 0);
+            const int frame = ((slotCount + saveCount) * 4 + 15) & ~15;
+            int saveCursor = frame;
+            int raOffset = -1;
+            if (hasCall) {
+                saveCursor -= 4;
+                raOffset = saveCursor;
+            }
+            std::unordered_map<std::string, int> savedOffset;
+            for (const auto &reg : saved) {
+                saveCursor -= 4;
+                savedOffset[reg] = saveCursor;
+            }
+
+            auto stackMemory = [&](const char *op, const std::string &reg, int offset) {
+                if (offset >= -2048 && offset <= 2047)
+                    o << "  " << op << " " << reg << ", " << offset << "(sp)\n";
+                else
+                    o << "  li t3, " << offset << "\n  add t3, sp, t3\n  " << op << " " << reg
+                      << ", 0(t3)\n";
+            };
+            auto adjustStack = [&](int amount) {
+                if (!amount)
+                    return;
+                if (amount >= -2048 && amount <= 2047)
+                    o << "  addi sp, sp, " << amount << "\n";
+                else
+                    o << "  li t3, " << amount << "\n  add sp, sp, t3\n";
+            };
+            auto constant = [&](const std::string &value) -> std::optional<int> {
+                if (auto found = constants.find(value); found != constants.end())
+                    return found->second;
+                return std::nullopt;
+            };
+            auto reg = [&](const std::string &value, const char *scratch) {
+                if (value.empty())
+                    return std::string(scratch);
+                if (value == "0")
                     return std::string("zero");
-                if (s[0] == 't') {
-                    if (auto found = allocation.find(s); found != allocation.end())
+                if (auto imm = constant(value)) {
+                    o << "  li " << scratch << ", " << *imm << "\n";
+                    return std::string(scratch);
+                }
+                if (isVirtual(value)) {
+                    if (auto found = allocation.find(value); found != allocation.end())
                         return found->second;
-                    stackMemory("lw", r, slot[s] * 4);
-                    return std::string(r);
+                    stackMemory("lw", scratch, slot[value] * 4);
+                    return std::string(scratch);
                 }
-                if (s.rfind("arg", 0) == 0) {
-                    stackMemory("lw", r, frame + std::stoi(s.substr(3)) * 4);
-                    return std::string(r);
+                if (value.rfind("arg", 0) == 0) {
+                    stackMemory("lw", scratch, frame + std::stoi(value.substr(3)) * 4);
+                    return std::string(scratch);
                 }
-                return s;
+                return value;
             };
-            auto put = [&](const std::string &s, const char *r) {
-                // 临时量写回栈槽，a0 等真实寄存器则直接使用 mv。
-                if (!s.empty() && s[0] == 't') {
-                    if (auto found = allocation.find(s); found != allocation.end()) {
-                        if (found->second != r)
-                            o << "  mv " << found->second << ", " << r << "\n";
+            auto destination = [&](const std::string &value, const char *scratch) {
+                if (auto found = allocation.find(value); found != allocation.end())
+                    return found->second;
+                if (isVirtual(value))
+                    return std::string(scratch);
+                return value;
+            };
+            auto put = [&](const std::string &value, const std::string &source) {
+                if (isVirtual(value)) {
+                    if (auto found = allocation.find(value); found != allocation.end()) {
+                        if (found->second != source)
+                            o << "  mv " << found->second << ", " << source << "\n";
                     } else
-                        stackMemory("sw", r, slot[s] * 4);
-                }
-                else if (!s.empty())
-                    o << "  mv " << s << ", " << r << "\n";
+                        stackMemory("sw", source, slot[value] * 4);
+                } else if (!value.empty() && value != source)
+                    o << "  mv " << value << ", " << source << "\n";
             };
-            switch (i.op) {
-            case IR::Label:
-                // 函数标签需要序言；以 . 开头的局部控制流标签不创建新栈帧。
-                o << i.x << ":\n";
-                if (i.x != "" && i.x[0] != '.') {
-                    adjustStack(-frame);
-                    stackMemory("sw", "ra", raOffset);
-                    for (size_t k = 0; k < saved.size(); ++k)
-                        stackMemory("sw", saved[k],
-                                    raOffset - 4 - static_cast<int>(k) * 4);
-                }
-                break;
-            case IR::Mov:
-                if (i.y.empty())
-                    o << "  li t0, " << i.imm << "\n";
-                else {
-                    auto q = reg(i.y, "t1");
-                    o << "  mv t0, " << q << "\n";
-                }
-                put(i.x, "t0");
-                break;
-            case IR::Bin: {
-                // 关系运算使用 slt/sub/seqz 等基础指令组合，结果规范化为 0 或 1。
-                auto a = reg(i.y, "t1"), b = reg(i.z, "t2");
-                if (i.aux == "!")
-                    o << "  seqz t0, " << b << "\n";
-                else if (i.aux == ">")
-                    o << "  slt t0, " << b << ", " << a << "\n";
-                else if (i.aux == "<=")
-                    o << "  slt t0, " << b << ", " << a << "\n  xori t0, t0, 1\n";
-                else if (i.aux == ">=")
-                    o << "  slt t0, " << a << ", " << b << "\n  xori t0, t0, 1\n";
-                else if (i.aux == "==")
-                    o << "  sub t0, " << a << ", " << b << "\n  seqz t0, t0\n";
-                else if (i.aux == "!=")
-                    o << "  sub t0, " << a << ", " << b << "\n  snez t0, t0\n";
-                else {
-                    o << "  "
-                      << (i.aux == "+"   ? "add"
-                          : i.aux == "-" ? "sub"
-                          : i.aux == "*" ? "mul"
-                          : i.aux == "/" ? "div"
-                          : i.aux == "%" ? "rem"
-                                         : "slt")
-                      << " t0, " << a << ", " << b << "\n";
-                }
-                put(i.x, "t0");
-                break;
-            }
-            case IR::Call: {
-                // 前八个实参进入 a0-a7，额外实参在调用前压入 16 字节对齐的区域。
-                auto av = callArgs(i.y);
-                int extra = av.size() > 8 ? ((int(av.size() - 8) * 4 + 15) & ~15) : 0;
-                for (size_t k = 0; k < av.size(); ++k) {
-                    auto q = reg(av[k], "t0");
-                    if (k < 8)
-                        o << "  mv a" << k << ", " << q << "\n";
-                    else
-                        stackMemory("sw", q, -extra + int(k - 8) * 4);
-                }
-                if (extra)
-                    adjustStack(-extra);
-                o << "  call " << i.aux << "\n";
-                if (extra)
-                    adjustStack(extra);
-                put(i.x, "a0");
-                break;
-            }
-            case IR::Store:
-                // $ 前缀代表全局符号，其余位置由当前函数的栈槽表解析。
-                if (i.x[0] == '$') {
-                    o << "  la t1, " << i.x.substr(1) << "\n";
-                    auto q = reg(i.y, "t0");
-                    o << "  sw " << q << ", 0(t1)\n";
-                } else {
-                    auto q = reg(i.y, "t0");
-                    stackMemory("sw", q, slot[i.x] * 4);
-                }
-                break;
-            case IR::BrZ: {
-                auto q = reg(i.x, "t0");
-                o << "  beqz " << q << ", " << i.y << "\n";
-                break;
-            }
-            case IR::Jump:
-                o << "  j " << i.x << "\n";
-                break;
-            case IR::Ret:
-                for (size_t k = 0; k < saved.size(); ++k)
-                    stackMemory("lw", saved[k],
-                                raOffset - 4 - static_cast<int>(k) * 4);
-                // 统一恢复返回地址和栈指针，然后交还控制权。
-                stackMemory("lw", "ra", raOffset);
+            auto epilogue = [&] {
+                for (const auto &savedReg : saved)
+                    stackMemory("lw", savedReg, savedOffset[savedReg]);
+                if (hasCall)
+                    stackMemory("lw", "ra", raOffset);
                 adjustStack(frame);
                 o << "  ret\n";
-                break;
-            case IR::Load:
-                // 全局变量经 la 获得地址，局部值直接按 sp 偏移读取。
-                if (i.y[0] == '$') {
-                    o << "  la t1, " << i.y.substr(1) << "\n  lw t0, 0(t1)\n";
-                } else
-                    stackMemory("lw", "t0", slot[i.y] * 4);
-                put(i.x, "t0");
-                break;
+            };
+
+            for (size_t position = 0; position < code.size(); ++position) {
+                const auto &ins = code[position];
+                switch (ins.op) {
+                case IR::Label:
+                    o << ins.x << ":\n";
+                    if (position == 0) {
+                        adjustStack(-frame);
+                        if (hasCall)
+                            stackMemory("sw", "ra", raOffset);
+                        for (const auto &savedReg : saved)
+                            stackMemory("sw", savedReg, savedOffset[savedReg]);
+                    }
+                    break;
+                case IR::Mov: {
+                    if (ins.y.empty() && constants.contains(ins.x))
+                        break;
+                    const std::string target = destination(ins.x, "t0");
+                    if (ins.y.empty())
+                        o << "  li " << target << ", " << ins.imm << "\n";
+                    else if (auto imm = constant(ins.y))
+                        o << "  li " << target << ", " << *imm << "\n";
+                    else {
+                        const std::string source = reg(ins.y, "t1");
+                        if (target != source)
+                            o << "  mv " << target << ", " << source << "\n";
+                    }
+                    put(ins.x, target);
+                    break;
+                }
+                case IR::Bin: {
+                    const std::string target = destination(ins.x, "t0");
+                    const auto leftImm = constant(ins.y);
+                    const auto rightImm = constant(ins.z);
+                    bool emitted = false;
+                    if (ins.aux == "+" && rightImm && *rightImm >= -2048 && *rightImm <= 2047) {
+                        const auto left = reg(ins.y, "t1");
+                        o << "  addi " << target << ", " << left << ", " << *rightImm << "\n";
+                        emitted = true;
+                    } else if (ins.aux == "+" && leftImm && *leftImm >= -2048 && *leftImm <= 2047) {
+                        const auto right = reg(ins.z, "t2");
+                        o << "  addi " << target << ", " << right << ", " << *leftImm << "\n";
+                        emitted = true;
+                    } else if (ins.aux == "-" && rightImm && *rightImm >= -2047 &&
+                               *rightImm <= 2048) {
+                        const auto left = reg(ins.y, "t1");
+                        o << "  addi " << target << ", " << left << ", " << -*rightImm << "\n";
+                        emitted = true;
+                    } else if (ins.aux == "*" && (leftImm || rightImm)) {
+                        const int factor = leftImm ? *leftImm : *rightImm;
+                        if (factor > 0 && (factor & (factor - 1)) == 0) {
+                            int shift = 0;
+                            for (int value = factor; value > 1; value >>= 1)
+                                ++shift;
+                            const auto source = reg(leftImm ? ins.z : ins.y, "t1");
+                            o << "  slli " << target << ", " << source << ", " << shift << "\n";
+                            emitted = true;
+                        }
+                    }
+                    if (!emitted) {
+                        const auto left = reg(ins.y, "t1");
+                        const auto right = reg(ins.z, "t2");
+                        if (ins.aux == "!")
+                            o << "  seqz " << target << ", " << right << "\n";
+                        else if (ins.aux == "bool")
+                            o << "  snez " << target << ", " << right << "\n";
+                        else if (ins.aux == ">")
+                            o << "  slt " << target << ", " << right << ", " << left << "\n";
+                        else if (ins.aux == "<=")
+                            o << "  slt " << target << ", " << right << ", " << left << "\n  xori "
+                              << target << ", " << target << ", 1\n";
+                        else if (ins.aux == ">=")
+                            o << "  slt " << target << ", " << left << ", " << right << "\n  xori "
+                              << target << ", " << target << ", 1\n";
+                        else if (ins.aux == "==")
+                            o << "  sub " << target << ", " << left << ", " << right << "\n  seqz "
+                              << target << ", " << target << "\n";
+                        else if (ins.aux == "!=")
+                            o << "  sub " << target << ", " << left << ", " << right << "\n  snez "
+                              << target << ", " << target << "\n";
+                        else
+                            o << "  "
+                              << (ins.aux == "+"   ? "add"
+                                  : ins.aux == "-" ? "sub"
+                                  : ins.aux == "*" ? "mul"
+                                  : ins.aux == "/" ? "div"
+                                  : ins.aux == "%" ? "rem"
+                                                   : "slt")
+                              << " " << target << ", " << left << ", " << right << "\n";
+                    }
+                    put(ins.x, target);
+                    break;
+                }
+                case IR::Call: {
+                    const auto args = callArgs(ins.y);
+                    const int extra =
+                        args.size() > 8 ? ((static_cast<int>(args.size() - 8) * 4 + 15) & ~15) : 0;
+                    for (size_t k = 0; k < args.size(); ++k) {
+                        const auto source = reg(args[k], "t0");
+                        if (k < 8) {
+                            if (source != "a" + std::to_string(k))
+                                o << "  mv a" << k << ", " << source << "\n";
+                        } else
+                            stackMemory("sw", source, -extra + static_cast<int>(k - 8) * 4);
+                    }
+                    adjustStack(-extra);
+                    o << "  call " << ins.aux << "\n";
+                    adjustStack(extra);
+                    put(ins.x, "a0");
+                    break;
+                }
+                case IR::Store:
+                    if (!ins.x.empty() && ins.x[0] == '$') {
+                        const auto source = reg(ins.y, "t0");
+                        o << "  la t1, " << ins.x.substr(1) << "\n  sw " << source << ", 0(t1)\n";
+                    } else {
+                        const auto source = reg(ins.y, "t0");
+                        put(ins.x, source);
+                    }
+                    break;
+                case IR::Load: {
+                    const auto target = destination(ins.x, "t0");
+                    if (!ins.y.empty() && ins.y[0] == '$')
+                        o << "  la t1, " << ins.y.substr(1) << "\n  lw " << target << ", 0(t1)\n";
+                    else {
+                        const auto source = reg(ins.y, "t1");
+                        if (target != source)
+                            o << "  mv " << target << ", " << source << "\n";
+                    }
+                    put(ins.x, target);
+                    break;
+                }
+                case IR::BrZ: {
+                    const auto condition = reg(ins.x, "t0");
+                    o << "  beqz " << condition << ", " << ins.y << "\n";
+                    break;
+                }
+                case IR::Jump:
+                    o << "  j " << ins.x << "\n";
+                    break;
+                case IR::Ret:
+                    epilogue();
+                    break;
+                }
             }
+            begin = end;
         }
     }
 };

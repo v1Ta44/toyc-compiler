@@ -1,0 +1,26 @@
+int side_effect = 0;
+const int folded_and = 1 && 9;
+const int folded_or = 0 || 4;
+
+int mark() {
+  side_effect = side_effect + 7;
+  return 5;
+}
+
+int main() {
+  int value = 3;
+  int unary_plus = +value;
+  int logical_values = (value && 9) + (0 || 4);
+
+  0 || mark();
+  1 || mark();
+  0 && mark();
+
+  int precedence = 2 == 1 < 1;
+  if (unary_plus == 3 && logical_values == 2 && side_effect == 7 && precedence == 0 &&
+      folded_and == 1 && folded_or == 1) {
+    return 1;
+  } else {
+    return 0;
+  }
+}

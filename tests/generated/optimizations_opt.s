@@ -1,86 +1,31 @@
 .text
 .globl main
 identity:
-  addi sp, sp, -48
-  sw ra, 44(sp)
-  sw s10, 40(sp)
-  sw s11, 36(sp)
-  sw s8, 32(sp)
-  sw s9, 28(sp)
-  sw a0, 0(sp)
-  lw t0, 0(sp)
-  mv s11, t0
-  mv t0, s11
-  mv a0, t0
-  lw s10, 40(sp)
-  lw s11, 36(sp)
-  lw s8, 32(sp)
-  lw s9, 28(sp)
-  lw ra, 44(sp)
-  addi sp, sp, 48
   ret
 main:
-  addi sp, sp, -48
-  sw ra, 44(sp)
-  sw s10, 40(sp)
-  sw s11, 36(sp)
-  sw s8, 32(sp)
-  sw s9, 28(sp)
-  li t0, 4
-  mv s11, t0
-  sw s11, 4(sp)
-  li t0, 7
-  mv s11, t0
-  sw s11, 8(sp)
-  lw t0, 4(sp)
-  mv s11, t0
-  lw t0, 8(sp)
-  mv s10, t0
-  add t0, s11, s10
-  mv s9, t0
-  mul t0, s9, s9
-  mv s8, t0
-  sw s8, 12(sp)
-  sw s8, 16(sp)
-  li t0, 1
-  mv s8, t0
-  add t0, s11, s8
-  mv s9, t0
-  sw s9, 4(sp)
-  lw t0, 4(sp)
-  mv s9, t0
-  add t0, s9, s10
-  mv s8, t0
-  mul t0, s8, s8
-  mv s9, t0
-  sw s9, 20(sp)
-  lw t0, 12(sp)
-  mv s9, t0
-  lw t0, 16(sp)
-  mv s8, t0
-  add t0, s9, s8
-  mv s10, t0
-  lw t0, 20(sp)
-  mv s8, t0
-  mv a0, s8
+  addi sp, sp, -16
+  sw ra, 12(sp)
+  sw s1, 8(sp)
+  sw s2, 4(sp)
+  li t4, 4
+  li t5, 7
+  add t6, t4, t5
+  mul s1, t6, t6
+  mv t6, s1
+  mv s2, s1
+  addi t4, t4, 1
+  add s1, t4, t5
+  mul t4, s1, s1
+  add s1, t6, s2
+  mv a0, t4
   call identity
-  mv s9, a0
-  add t0, s10, s9
-  mv s8, t0
-  sw s8, 24(sp)
-  lw t0, 24(sp)
-  mv s8, t0
-  li t0, 386
-  mv s9, t0
-  sub t0, s8, s9
-  seqz t0, t0
-  mv s10, t0
-  mv t0, s10
-  mv a0, t0
-  lw s10, 40(sp)
-  lw s11, 36(sp)
-  lw s8, 32(sp)
-  lw s9, 28(sp)
-  lw ra, 44(sp)
-  addi sp, sp, 48
+  mv t5, a0
+  add t4, s1, t5
+  li t2, 386
+  sub a0, t4, t2
+  seqz a0, a0
+  lw s1, 8(sp)
+  lw s2, 4(sp)
+  lw ra, 12(sp)
+  addi sp, sp, 16
   ret

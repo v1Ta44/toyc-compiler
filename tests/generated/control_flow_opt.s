@@ -5,106 +5,52 @@ global:
 .text
 .globl main
 main:
-  addi sp, sp, -32
-  sw ra, 28(sp)
-  sw s10, 24(sp)
-  sw s11, 20(sp)
-  sw s8, 16(sp)
-  sw s9, 12(sp)
-  li t0, 0
-  mv s11, t0
-  sw s11, 0(sp)
-  li t0, 0
-  mv s11, t0
-  sw s11, 4(sp)
+  addi sp, sp, -16
+  sw s1, 12(sp)
+  li t4, 0
+  li t5, 0
 .L4:
-  lw t0, 4(sp)
-  mv s11, t0
-  li t0, 10
-  mv s10, t0
-  slt t0, s11, s10
-  mv s9, t0
-  beqz s9, .L5
-  lw t0, 4(sp)
-  mv s9, t0
-  li t0, 1
-  mv s10, t0
-  add t0, s9, s10
-  mv s11, t0
-  sw s11, 4(sp)
-  lw t0, 4(sp)
-  mv s11, t0
-  li t0, 2
-  mv s10, t0
-  rem t0, s11, s10
-  mv s9, t0
-  li t0, 0
-  mv s10, t0
-  sub t0, s9, s10
-  seqz t0, t0
-  mv s11, t0
-  beqz s11, .L17
+  li t2, 10
+  slt t6, t5, t2
+  beqz t6, .L5
+  addi t5, t5, 1
+  li t2, 2
+  rem t6, t5, t2
+  li t2, 0
+  sub s1, t6, t2
+  seqz s1, s1
+  beqz s1, .L14
   j .L4
-.L17:
-  lw t0, 4(sp)
-  mv s11, t0
-  li t0, 9
-  mv s10, t0
-  sub t0, s11, s10
-  seqz t0, t0
-  mv s9, t0
-  beqz s9, .L22
+.L14:
+  li t2, 9
+  sub t6, t5, t2
+  seqz t6, t6
+  beqz t6, .L18
   j .L5
-.L22:
-  lw t0, 0(sp)
-  mv s9, t0
-  lw t0, 4(sp)
-  mv s10, t0
-  add t0, s9, s10
-  mv s11, t0
-  sw s11, 0(sp)
+.L18:
+  add t4, t4, t5
   j .L4
 .L5:
   la t1, global
-  lw t0, 0(t1)
-  mv s11, t0
-  li t0, 3
-  mv s10, t0
-  sub t0, s11, s10
-  seqz t0, t0
-  mv s9, t0
-  li t0, 0
-  mv s10, t0
-  beqz s9, .L32
-  lw t0, 0(sp)
-  mv s9, t0
-  li t0, 16
-  mv s11, t0
-  sub t0, s9, s11
-  seqz t0, t0
-  mv s8, t0
-  seqz t0, s8
-  mv s10, t0
-  j .L31
-.L32:
-.L31:
-  li t0, 1
-  mv s8, t0
-  beqz s10, .L38
-  j .L37
-  li t0, 0
-  mv s10, t0
-  seqz t0, s10
-  mv s8, t0
-  j .L37
-.L38:
-.L37:
-  mv t0, s8
-  mv a0, t0
-  lw s10, 24(sp)
-  lw s11, 20(sp)
-  lw s8, 16(sp)
-  lw s9, 12(sp)
-  lw ra, 28(sp)
-  addi sp, sp, 32
+  lw t5, 0(t1)
+  li t2, 3
+  sub t6, t5, t2
+  seqz t6, t6
+  li t5, 0
+  beqz t6, .L25
+  li t2, 16
+  sub t6, t4, t2
+  seqz t6, t6
+  snez t5, t6
+.L25:
+  li t4, 1
+  beqz t5, .L30
+  j .L29
+.L30:
+  li t2, 0
+  snez t4, t2
+.L29:
+  mv a0, t4
+  lw s1, 12(sp)
+  addi sp, sp, 16
   ret

@@ -45,8 +45,8 @@ sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-us
 bash tests/run_wsl.sh
 ```
 
-脚本会重新构建编译器、生成四份 RV32 汇编、以 `rv32im/ilp32` ABI
-静态链接，并通过 `qemu-riscv32` 执行。当前实测结果：
+脚本会重新构建编译器、生成 RV32 汇编、以 `rv32im/ilp32` ABI
+静态链接，并通过 `qemu-riscv32` 执行，同时检查优化后的静态指令数量。
 
 ```text
 PASS recursion: exit=120
@@ -55,11 +55,12 @@ PASS control_flow: exit=1
 PASS control_flow_opt: exit=1
 ```
 
-`-opt` enables removal of branches with compile-time-known conditions, local
-common-subexpression elimination, and linear-scan register allocation. The CSE
-pass respects stores, calls, and basic-block boundaries. Register allocation
-uses the callee-saved `s1`-`s11` registers and spills excess live values to the
-stack. Constant expressions are folded during lowering in both modes.
+`-opt` enables local-slot promotion, versioned common-subexpression elimination,
+algebraic simplification, CFG reachability pruning, dead-code and move removal,
+and per-function call-aware register allocation. Short-lived values prefer
+`t4`-`t6`; values live across calls use `s1`-`s11`, and only excess values spill.
+Leaf functions avoid unnecessary frames and `ra` saves. Constant expressions
+are folded during lowering in both modes.
 
 The output uses the RV32I/M integer instruction set. Calls use `a0`-`a7` for
 the first eight integer arguments and stack-passed arguments thereafter.
