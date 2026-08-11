@@ -58,32 +58,39 @@ class Generator {
     // 代数化简、无用临时量删除和相邻跳转清理，均只处理无副作用 IR。
     void simplifyIR() {
         auto isTemp = [](const std::string &v) { return !v.empty() && v[0] == 't'; };
-        auto isZero = [](const std::string &v) { return v == "0"; };
-        auto isOne = [](const std::string &v) { return v == "1"; };
+        std::unordered_map<std::string, int> constants;
+        for (const auto &ins : ir_)
+            if (ins.op == IR::Mov && ins.y.empty() && isTemp(ins.x))
+                constants[ins.x] = ins.imm;
+        auto isConstant = [&](const std::string &v, int expected) {
+            auto found = constants.find(v);
+            return found != constants.end() && found->second == expected;
+        };
 
         for (auto &ins : ir_) {
             if (ins.op != IR::Bin)
                 continue;
             // x + 0, x - 0, x * 1, x / 1 等恒等式直接变为拷贝。
-            if ((ins.aux == "+" || ins.aux == "-") && isZero(ins.z)) {
+            if ((ins.aux == "+" || ins.aux == "-") && isConstant(ins.z, 0)) {
                 ins.op = IR::Mov;
                 ins.z.clear();
                 ins.aux.clear();
-            } else if ((ins.aux == "+") && isZero(ins.y)) {
-                ins.op = IR::Mov;
-                ins.y = ins.z;
-                ins.z.clear();
-                ins.aux.clear();
-            } else if ((ins.aux == "*" || ins.aux == "/") && isOne(ins.z)) {
-                ins.op = IR::Mov;
-                ins.z.clear();
-                ins.aux.clear();
-            } else if (ins.aux == "*" && isOne(ins.y)) {
+            } else if (ins.aux == "+" && isConstant(ins.y, 0)) {
                 ins.op = IR::Mov;
                 ins.y = ins.z;
                 ins.z.clear();
                 ins.aux.clear();
-            } else if (ins.aux == "*" && (isZero(ins.y) || isZero(ins.z))) {
+            } else if ((ins.aux == "*" || ins.aux == "/") && isConstant(ins.z, 1)) {
+                ins.op = IR::Mov;
+                ins.z.clear();
+                ins.aux.clear();
+            } else if (ins.aux == "*" && isConstant(ins.y, 1)) {
+                ins.op = IR::Mov;
+                ins.y = ins.z;
+                ins.z.clear();
+                ins.aux.clear();
+            } else if (ins.aux == "*" &&
+                       (isConstant(ins.y, 0) || isConstant(ins.z, 0))) {
                 ins.op = IR::Mov;
                 ins.y.clear();
                 ins.z.clear();
