@@ -1,0 +1,459 @@
+#include "compiler.hpp"
+#include <algorithm>
+#include <sstream>
+#include <stdexcept>
+namespace toyc {
+// 由 Bison 填充，main 在解析完成后把它交给后端。
+Program *g_program = nullptr;
+
+// 表达式求值的中间结果。常量直接放在 n 中，运行期值由 v 指向虚拟临时量或存储位置。
+struct Value {
+    bool constant{};
+    int n{};
+    std::string v;
+};
+
+// 项目自建的三地址 IR。x 通常为目标，y/z 为操作数，aux 保存运算符或被调函数名。
+struct IR {
+    enum Op { Label, Mov, Bin, Load, Store, Call, Ret, Jump, BrZ };
+    Op op;
+    std::string x, y, z, aux;
+    int imm{};
+};
+
+// Generator 同时负责 AST -> IR 的降低和 IR -> RV32 的线性代码生成。
+class Generator {
+    // IR 按源程序执行顺序保存，控制流使用显式 Label/Jump/BrZ 表示。
+    std::vector<IR> ir_;
+    // scopes_ 从外到内保存局部符号表；反向查找自然实现词法作用域遮蔽。
+    std::vector<std::unordered_map<std::string, Value>> scopes_;
+    std::unordered_map<std::string, Value> globals_;
+    // 每层循环保存 break 目标和 continue 目标，以支持嵌套循环。
+    std::vector<std::pair<std::string, std::string>> loops_;
+    // 非 const 全局量最终输出到 .data 段。
+    std::vector<std::pair<std::string, int>> data_;
+    int next_ = 0;
+    bool opt_;
+
+    // 临时值和标签共享单调编号，确保整个编译单元内名称唯一。
+    std::string tmp() {
+        return "t" + std::to_string(next_++);
+    }
+    std::string label() {
+        return ".L" + std::to_string(next_++);
+    }
+    void emit(IR x) {
+        ir_.push_back(std::move(x));
+    }
+
+    // 按“当前块 -> 外层块 -> 全局”的顺序解析标识符。
+    Value find(const std::string &n) {
+        for (auto i = scopes_.rbegin(); i != scopes_.rend(); ++i)
+            if (auto p = i->find(n); p != i->end())
+                return p->second;
+        if (auto p = globals_.find(n); p != globals_.end())
+            return p->second;
+        throw std::runtime_error("undefined identifier: " + n);
+    }
+
+    // 编译期计算纯常量二元表达式，是常量折叠和 const 初始化检查的基础。
+    static int calc(const std::string &o, int a, int b) {
+        if (o == "+")
+            return a + b;
+        if (o == "-")
+            return a - b;
+        if (o == "*")
+            return a * b;
+        if (o == "/")
+            return a / b;
+        if (o == "%")
+            return a % b;
+        if (o == "<")
+            return a < b;
+        if (o == ">")
+            return a > b;
+        if (o == "<=")
+            return a <= b;
+        if (o == ">=")
+            return a >= b;
+        if (o == "==")
+            return a == b;
+        if (o == "!=")
+            return a != b;
+        if (o == "&&")
+            return !!a && !!b;
+        return !!a || !!b;
+    }
+
+    // 将一个表达式降低为 IR，并返回常量值或承载结果的虚拟临时量。
+    Value ex(Expr *e) {
+        if (e->kind == Expr::Num)
+            return {true, e->value, {}};
+        if (e->kind == Expr::Var) {
+            auto v = find(e->name);
+            if (v.constant)
+                return v;
+            std::string t = tmp();
+            emit({IR::Load, t, v.v});
+            return {false, 0, t};
+        }
+        if (e->kind == Expr::Call) {
+            // 实参先从左到右求值，再用逗号分隔的临时量列表编码到 Call IR。
+            std::string a;
+            for (auto &x : e->args) {
+                auto q = ex(x.get());
+                if (q.constant) {
+                    std::string t = tmp();
+                    emit({IR::Mov, t, {}, {}, {}, q.n});
+                    a += t + ",";
+                } else
+                    a += q.v + ",";
+            }
+            std::string t = tmp();
+            emit({IR::Call, t, a, {}, e->name});
+            return {false, 0, t};
+        }
+        auto a = ex(e->a.get());
+        if (e->kind == Expr::Unary) {
+            // 常量一元运算直接折叠；运行期运算复用 Bin 指令表示。
+            if (a.constant) {
+                if (e->op == "-")
+                    a.n = -a.n;
+                else if (e->op == "!")
+                    a.n = !a.n;
+                return a;
+            }
+            std::string t = tmp();
+            emit({IR::Bin, t, "0", a.v, e->op == "-" ? "-" : "!"});
+            return {false, 0, t};
+        }
+        if (e->op == "&&" || e->op == "||") {
+            // 逻辑运算不能简单转成普通二元指令，必须用分支保证右侧按需执行。
+            if (a.constant && ((e->op == "&&" && !a.n) || (e->op == "||" && a.n)))
+                return {true, e->op == "||", {}};
+            std::string av = a.constant ? tmp() : a.v;
+            if (a.constant)
+                emit({IR::Mov, av, {}, {}, {}, a.n});
+            std::string t = tmp(), done = label(), skip = label();
+            emit({IR::Mov, t, {}, {}, {}, e->op == "||" ? 1 : 0});
+            if (e->op == "&&")
+                emit({IR::BrZ, av, skip});
+            else {
+                emit({IR::BrZ, av, skip});
+                emit({IR::Jump, done});
+            }
+            auto b = ex(e->b.get());
+            std::string bv = b.constant ? tmp() : b.v;
+            if (b.constant)
+                emit({IR::Mov, bv, {}, {}, {}, b.n});
+            emit({IR::Bin, t, "0", bv, "!"});
+            emit({IR::Jump, done});
+            emit({IR::Label, skip});
+            emit({IR::Label, done});
+            return {false, 0, t};
+        }
+        auto b = ex(e->b.get());
+        if (a.constant && b.constant) {
+            // 合法输入不会除零，但在编译期发现时仍给出明确诊断。
+            if ((e->op == "/" || e->op == "%") && !b.n)
+                throw std::runtime_error("division by zero");
+            return {true, calc(e->op, a.n, b.n), {}};
+        }
+        std::string av = a.constant ? tmp() : a.v, bv = b.constant ? tmp() : b.v;
+        if (a.constant)
+            emit({IR::Mov, av, {}, {}, {}, a.n});
+        if (b.constant)
+            emit({IR::Mov, bv, {}, {}, {}, b.n});
+        std::string t = tmp();
+        emit({IR::Bin, t, av, bv, e->op});
+        return {false, 0, t};
+    }
+
+    // 逐条降低语句。该函数通过递归处理块、分支和循环的嵌套结构。
+    void st(Stmt *s) {
+        if (s->kind == Stmt::Empty)
+            return;
+        if (s->kind == Stmt::Block) {
+            // 每个语句块拥有独立符号表，退出块时统一销毁该层名字。
+            scopes_.emplace_back();
+            for (auto &x : s->body)
+                st(x.get());
+            scopes_.pop_back();
+            return;
+        }
+        if (s->kind == Stmt::Decl) {
+            auto v = ex(s->expr.get());
+            if (s->isConst) {
+                // const 不分配运行期槽位，后续引用会直接传播常量值。
+                if (!v.constant)
+                    throw std::runtime_error("const initializer is not constant");
+                scopes_.back()[s->name] = v;
+                return;
+            }
+            std::string loc = "@l" + std::to_string(next_++), src = v.constant ? tmp() : v.v;
+            // 可变局部量必须保存在槽位中，循环回边才能观察到最新赋值。
+            if (v.constant)
+                emit({IR::Mov, src, {}, {}, {}, v.n});
+            emit({IR::Store, loc, src});
+            scopes_.back()[s->name] = {false, 0, loc};
+            return;
+        }
+        if (s->kind == Stmt::Assign) {
+            auto old = find(s->name);
+            if (old.constant)
+                throw std::runtime_error("assignment to const");
+            auto v = ex(s->expr.get());
+            std::string src = v.constant ? tmp() : v.v;
+            if (v.constant)
+                emit({IR::Mov, src, {}, {}, {}, v.n});
+            emit({IR::Store, old.v, src});
+            return;
+        }
+        if (s->kind == Stmt::ExprStmt) {
+            ex(s->expr.get());
+            return;
+        }
+        if (s->kind == Stmt::Return) {
+            // RISC-V ABI 规定整数返回值放在 a0。
+            auto v = s->expr ? ex(s->expr.get()) : Value{true, 0, {}};
+            if (v.constant)
+                emit({IR::Mov, "a0", {}, {}, {}, v.n});
+            else
+                emit({IR::Mov, "a0", v.v});
+            emit({IR::Ret});
+            return;
+        }
+        if (s->kind == Stmt::Break || s->kind == Stmt::Continue) {
+            if (loops_.empty())
+                throw std::runtime_error("loop control outside loop");
+            emit({IR::Jump, s->kind == Stmt::Break ? loops_.back().first : loops_.back().second});
+            return;
+        }
+        if (s->kind == Stmt::If) {
+            auto c = ex(s->cond.get());
+            if (opt_ && c.constant) {
+                // -opt 模式下只生成确定会执行的分支，省去不可达基本块。
+                if (c.n)
+                    st(s->thenS.get());
+                else if (s->elseS)
+                    st(s->elseS.get());
+                return;
+            }
+            std::string no = label(), done = label(), cv = c.constant ? tmp() : c.v;
+            if (c.constant)
+                emit({IR::Mov, cv, {}, {}, {}, c.n});
+            emit({IR::BrZ, cv, no});
+            st(s->thenS.get());
+            if (s->elseS)
+                emit({IR::Jump, done});
+            emit({IR::Label, no});
+            if (s->elseS) {
+                st(s->elseS.get());
+                emit({IR::Label, done});
+            }
+            return;
+        }
+        if (s->kind == Stmt::While) {
+            // while 被展开为 head 标签、条件分支、循环体、回跳和 done 标签。
+            std::string head = label(), done = label();
+            emit({IR::Label, head});
+            auto c = ex(s->cond.get());
+            std::string cv = c.constant ? tmp() : c.v;
+            if (c.constant)
+                emit({IR::Mov, cv, {}, {}, {}, c.n});
+            emit({IR::BrZ, cv, done});
+            loops_.push_back({done, head});
+            st(s->thenS.get());
+            loops_.pop_back();
+            emit({IR::Jump, head});
+            emit({IR::Label, done});
+        }
+    }
+
+  public:
+    explicit Generator(bool o) : opt_(o) {
+    }
+    void generate(Program &p) {
+        // 全局初始化必须在编译期可求值；常量只进入符号表，变量进入数据段。
+        for (auto &d : p.globals) {
+            auto v = ex(d.init.get());
+            if (!v.constant)
+                throw std::runtime_error("global initializer is not constant");
+            if (d.isConst)
+                globals_[d.name] = {true, v.n, {}};
+            else {
+                globals_[d.name] = {false, 0, "$" + d.name};
+                data_.push_back({d.name, v.n});
+            }
+        }
+        for (auto &f : p.funcs) {
+            // 每个函数从函数标签开始，并建立包含形参的最外层局部作用域。
+            emit({IR::Label, f->name});
+            scopes_.emplace_back();
+            for (size_t i = 0; i < f->params.size(); ++i) {
+                // 前八个参数来自 a0-a7，其余参数从调用者栈帧读取。
+                std::string loc = "@p" + std::to_string(next_++);
+                emit({IR::Store, loc,
+                      i < 8 ? "a" + std::to_string(i) : "arg" + std::to_string(i - 8)});
+                scopes_.back()[f->params[i]] = {false, 0, loc};
+            }
+            for (auto &s : f->body)
+                st(s.get());
+            if (f->ret == "void")
+                emit({IR::Ret});
+            scopes_.pop_back();
+        }
+    }
+
+    // 为全部虚拟值分配栈槽，再逐条翻译为 RV32I/M 汇编文本。
+    void output(std::ostream &o) {
+        if (!data_.empty()) {
+            o << ".data\n";
+            for (auto &[n, v] : data_)
+                o << ".globl " << n << "\n" << n << ":\n  .word " << v << "\n";
+        }
+        o << ".text\n";
+        std::unordered_map<std::string, int> slot;
+        int n = 0;
+        // t* 是表达式临时量，@* 是局部变量/形参槽位；二者都落在当前栈帧。
+        for (auto &i : ir_)
+            for (auto *s : {&i.x, &i.y, &i.z})
+                if (!s->empty() && ((*s)[0] == 't' || (*s)[0] == '@') && !slot.contains(*s))
+                    slot[*s] = n++;
+        n = ((((n + 4) * 4) + 15) & ~15) / 4 - 4;
+        int frame = (n + 4) * 4;
+        // 栈帧按 ABI 要求对齐到 16 字节，并预留保存 ra 的位置。
+        o << ".globl main\n";
+        for (auto &i : ir_) {
+            auto reg = [&](const std::string &s, const char *r) {
+                // 把抽象操作数物化到寄存器；普通 ABI 寄存器名可直接返回。
+                if (s.empty())
+                    return std::string(r);
+                if (s[0] == 't') {
+                    o << "  lw " << r << ", " << (slot[s] * 4) << "(sp)\n";
+                    return std::string(r);
+                }
+                if (s.rfind("arg", 0) == 0) {
+                    o << "  lw " << r << ", " << (frame + std::stoi(s.substr(3)) * 4) << "(sp)\n";
+                    return std::string(r);
+                }
+                return s;
+            };
+            auto put = [&](const std::string &s, const char *r) {
+                // 临时量写回栈槽，a0 等真实寄存器则直接使用 mv。
+                if (!s.empty() && s[0] == 't')
+                    o << "  sw " << r << ", " << (slot[s] * 4) << "(sp)\n";
+                else if (!s.empty())
+                    o << "  mv " << s << ", " << r << "\n";
+            };
+            switch (i.op) {
+            case IR::Label:
+                // 函数标签需要序言；以 . 开头的局部控制流标签不创建新栈帧。
+                o << i.x << ":\n";
+                if (i.x != "" && i.x[0] != '.')
+                    o << "  addi sp, sp, -" << ((n + 4) * 4) << "\n  sw ra, " << ((n + 3) * 4)
+                      << "(sp)\n";
+                break;
+            case IR::Mov:
+                if (i.y.empty())
+                    o << "  li t0, " << i.imm << "\n";
+                else {
+                    auto q = reg(i.y, "t1");
+                    o << "  mv t0, " << q << "\n";
+                }
+                put(i.x, "t0");
+                break;
+            case IR::Bin: {
+                // 关系运算使用 slt/sub/seqz 等基础指令组合，结果规范化为 0 或 1。
+                auto a = reg(i.y, "t1"), b = reg(i.z, "t2");
+                if (i.aux == "!")
+                    o << "  seqz t0, " << b << "\n";
+                else if (i.aux == ">")
+                    o << "  slt t0, " << b << ", " << a << "\n";
+                else if (i.aux == "<=")
+                    o << "  slt t0, " << b << ", " << a << "\n  xori t0, t0, 1\n";
+                else if (i.aux == ">=")
+                    o << "  slt t0, " << a << ", " << b << "\n  xori t0, t0, 1\n";
+                else if (i.aux == "==")
+                    o << "  sub t0, " << a << ", " << b << "\n  seqz t0, t0\n";
+                else if (i.aux == "!=")
+                    o << "  sub t0, " << a << ", " << b << "\n  snez t0, t0\n";
+                else {
+                    o << "  "
+                      << (i.aux == "+"   ? "add"
+                          : i.aux == "-" ? "sub"
+                          : i.aux == "*" ? "mul"
+                          : i.aux == "/" ? "div"
+                          : i.aux == "%" ? "rem"
+                                         : "slt")
+                      << " t0, " << a << ", " << b << "\n";
+                }
+                put(i.x, "t0");
+                break;
+            }
+            case IR::Call: {
+                // 前八个实参进入 a0-a7，额外实参在调用前压入 16 字节对齐的区域。
+                std::stringstream ss(i.y);
+                std::string a;
+                std::vector<std::string> av;
+                while (std::getline(ss, a, ','))
+                    if (!a.empty())
+                        av.push_back(a);
+                int extra = av.size() > 8 ? ((int(av.size() - 8) * 4 + 15) & ~15) : 0;
+                for (size_t k = 0; k < av.size(); ++k) {
+                    auto q = reg(av[k], "t0");
+                    if (k < 8)
+                        o << "  mv a" << k << ", " << q << "\n";
+                    else
+                        o << "  sw " << q << ", " << (-extra + int(k - 8) * 4) << "(sp)\n";
+                }
+                if (extra)
+                    o << "  addi sp, sp, -" << extra << "\n";
+                o << "  call " << i.aux << "\n";
+                if (extra)
+                    o << "  addi sp, sp, " << extra << "\n";
+                put(i.x, "a0");
+                break;
+            }
+            case IR::Store:
+                // $ 前缀代表全局符号，其余位置由当前函数的栈槽表解析。
+                if (i.x[0] == '$') {
+                    o << "  la t1, " << i.x.substr(1) << "\n";
+                    auto q = reg(i.y, "t0");
+                    o << "  sw " << q << ", 0(t1)\n";
+                } else {
+                    auto q = reg(i.y, "t0");
+                    o << "  sw " << q << ", " << (slot[i.x] * 4) << "(sp)\n";
+                }
+                break;
+            case IR::BrZ: {
+                auto q = reg(i.x, "t0");
+                o << "  beqz " << q << ", " << i.y << "\n";
+                break;
+            }
+            case IR::Jump:
+                o << "  j " << i.x << "\n";
+                break;
+            case IR::Ret:
+                // 统一恢复返回地址和栈指针，然后交还控制权。
+                o << "  lw ra, " << ((n + 3) * 4) << "(sp)\n  addi sp, sp, " << ((n + 4) * 4)
+                  << "\n  ret\n";
+                break;
+            case IR::Load:
+                // 全局变量经 la 获得地址，局部值直接按 sp 偏移读取。
+                if (i.y[0] == '$') {
+                    o << "  la t1, " << i.y.substr(1) << "\n  lw t0, 0(t1)\n";
+                } else
+                    o << "  lw t0, " << (slot[i.y] * 4) << "(sp)\n";
+                put(i.x, "t0");
+                break;
+            }
+        }
+    }
+};
+void compile(Program &p, std::ostream &o, bool optimize) {
+    Generator g(optimize);
+    g.generate(p);
+    g.output(o);
+}
+} // namespace toyc
