@@ -7,9 +7,9 @@ side_effect:
 mark:
   la t1, side_effect
   lw t4, 0(t1)
-  addi t5, t4, 7
+  addi t4, t4, 7
   la t1, side_effect
-  sw t5, 0(t1)
+  sw t4, 0(t1)
   li a0, 5
   ret
 main:
@@ -21,21 +21,19 @@ main:
   addi s1, t1, 1
   call mark
   mv t4, a0
+  la t1, side_effect
+  lw t5, 0(t1)
   li t2, 2
   sub t4, s1, t2
   seqz t4, t4
-  li t1, 0
-  snez t5, t4
+  snez t6, t4
 .L19:
   li t4, 0
-  beqz t5, .L23
-  la t1, side_effect
-  lw t5, 0(t1)
+  beqz t6, .L23
   li t2, 7
-  sub t6, t5, t2
-  seqz t6, t6
-  li t1, 0
-  snez t4, t6
+  sub t4, t5, t2
+  seqz t4, t4
+  snez t4, t4
 .L23:
   li t5, 0
   beqz t4, .L28

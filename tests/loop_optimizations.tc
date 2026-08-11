@@ -1,0 +1,26 @@
+int total = 3;
+
+int read_total() {
+  return total;
+}
+
+int set_total(int value) {
+  total = value;
+  return total;
+}
+
+int kernel(int left, int right) {
+  int index = 0;
+  while (index < 20) {
+    total = total + left * right + left / 3;
+    index = index + 1;
+  }
+
+  int observed = read_total();
+  set_total(observed + 1);
+  return total;
+}
+
+int main() {
+  return kernel(12, 5) == 1284;
+}

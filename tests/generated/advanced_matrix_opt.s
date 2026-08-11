@@ -5,9 +5,9 @@ identity:
 dot3:
   mul t4, a0, a3
   mul t5, a1, a4
-  add t6, t4, t5
-  mul t4, a2, a5
-  add a0, t6, t4
+  add t4, t4, t5
+  mul t5, a2, a5
+  add a0, t4, t5
   ret
 main:
   addi sp, sp, -16

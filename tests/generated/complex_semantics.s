@@ -49,8 +49,7 @@ main:
   lw t2, 28(sp)
   snez t0, t2
   sw t0, 32(sp)
-  li t0, 0
-  sw t0, 36(sp)
+  sw zero, 36(sp)
   lw t1, 8(sp)
   mv t0, t1
   sw t0, 40(sp)

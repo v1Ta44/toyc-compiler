@@ -1,0 +1,26 @@
+int left = 1;
+int right = 10;
+
+int read_left() {
+  return left;
+}
+
+int write_right(int value) {
+  right = value;
+  return right;
+}
+
+int recursive_update(int depth) {
+  left = left + depth;
+  if (depth <= 0) {
+    return left + right;
+  }
+  int nested = recursive_update(depth - 1);
+  return nested + left + right;
+}
+
+int main() {
+  int result = recursive_update(3);
+  write_right(result);
+  return read_left() + right;
+}

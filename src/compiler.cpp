@@ -106,6 +106,215 @@ class Generator {
         }
     }
 
+    // ToyC 没有指针和 volatile；全局量可在函数内缓存，只需在相关调用和返回边界同步。
+    void promoteGlobals() {
+        struct Effects {
+            std::unordered_set<std::string> directReads;
+            std::unordered_set<std::string> directWrites;
+            std::unordered_set<std::string> reads;
+            std::unordered_set<std::string> writes;
+            std::vector<std::string> callees;
+        };
+
+        std::unordered_map<std::string, Effects> effects;
+        std::string function;
+        for (const auto &ins : ir_) {
+            if (ins.op == IR::Label && !ins.x.empty() && ins.x[0] != '.') {
+                function = ins.x;
+                effects.try_emplace(function);
+            } else if (!function.empty() && ins.op == IR::Load && !ins.y.empty() &&
+                       ins.y[0] == '$') {
+                effects[function].directReads.insert(ins.y);
+            } else if (!function.empty() && ins.op == IR::Store && !ins.x.empty() &&
+                       ins.x[0] == '$') {
+                effects[function].directWrites.insert(ins.x);
+            } else if (!function.empty() && ins.op == IR::Call) {
+                effects[function].callees.push_back(ins.aux);
+            }
+        }
+        for (auto &[name, effect] : effects) {
+            effect.reads = effect.directReads;
+            effect.writes = effect.directWrites;
+        }
+
+        // 递归调用图通过不动点传播；调用点据此只同步被被调函数真正访问的全局量。
+        bool effectsChanged = true;
+        while (effectsChanged) {
+            effectsChanged = false;
+            for (auto &[name, effect] : effects) {
+                for (const auto &callee : effect.callees) {
+                    auto found = effects.find(callee);
+                    if (found == effects.end())
+                        continue;
+                    for (const auto &global : found->second.reads)
+                        effectsChanged |= effect.reads.insert(global).second;
+                    for (const auto &global : found->second.writes)
+                        effectsChanged |= effect.writes.insert(global).second;
+                }
+            }
+        }
+
+        std::vector<IR> result;
+        for (size_t begin = 0; begin < ir_.size();) {
+            size_t end = begin + 1;
+            while (end < ir_.size() &&
+                   !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
+                ++end;
+
+            const std::string &name = ir_[begin].x;
+            const auto effect = effects.find(name);
+            if (effect == effects.end() ||
+                (effect->second.directReads.empty() && effect->second.directWrites.empty())) {
+                result.insert(result.end(), ir_.begin() + begin, ir_.begin() + end);
+                begin = end;
+                continue;
+            }
+
+            std::vector<std::string> globals(effect->second.directReads.begin(),
+                                             effect->second.directReads.end());
+            for (const auto &global : effect->second.directWrites)
+                if (std::find(globals.begin(), globals.end(), global) == globals.end())
+                    globals.push_back(global);
+            std::sort(globals.begin(), globals.end());
+            std::unordered_map<std::string, std::string> shadow;
+            for (const auto &global : globals)
+                shadow[global] = "@g" + std::to_string(next_++);
+
+            result.push_back(ir_[begin]);
+            for (const auto &global : globals)
+                result.emplace_back(IR::Load, shadow[global], global);
+
+            auto flushReturn = [&] {
+                for (const auto &global : globals)
+                    if (effect->second.directWrites.contains(global))
+                        result.emplace_back(IR::Store, global, shadow[global]);
+            };
+            for (size_t i = begin + 1; i < end; ++i) {
+                IR ins = ir_[i];
+                // 返回值写 a0 后不能再读取可能分配到 a0 的全局缓存，故先完成写回。
+                if (ins.op == IR::Mov && ins.x == "a0" && i + 1 < end && ir_[i + 1].op == IR::Ret)
+                    flushReturn();
+
+                if (ins.op == IR::Load && shadow.contains(ins.y)) {
+                    ins.op = IR::Mov;
+                    ins.y = shadow[ins.y];
+                } else if (ins.op == IR::Store && shadow.contains(ins.x)) {
+                    ins.op = IR::Mov;
+                    ins.x = shadow[ins.x];
+                } else if (ins.op == IR::Call) {
+                    const auto callee = effects.find(ins.aux);
+                    const bool unknown = callee == effects.end();
+                    for (const auto &global : globals) {
+                        const bool mayAccess = unknown || callee->second.reads.contains(global) ||
+                                               callee->second.writes.contains(global);
+                        if (mayAccess && effect->second.directWrites.contains(global))
+                            result.emplace_back(IR::Store, global, shadow[global]);
+                    }
+                    result.push_back(std::move(ins));
+                    for (const auto &global : globals)
+                        if (unknown || callee->second.writes.contains(global))
+                            result.emplace_back(IR::Load, shadow[global], global);
+                    continue;
+                } else if (ins.op == IR::Ret &&
+                           !(i > begin + 1 && ir_[i - 1].op == IR::Mov && ir_[i - 1].x == "a0")) {
+                    flushReturn();
+                }
+                result.push_back(std::move(ins));
+            }
+            begin = end;
+        }
+        ir_ = std::move(result);
+    }
+
+    // 将自然循环中仅依赖循环外值的纯计算移到循环头之前，嵌套循环由内向外反复处理。
+    void hoistLoopInvariants() {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t begin = 0; begin < ir_.size() && !changed;) {
+                size_t end = begin + 1;
+                while (end < ir_.size() &&
+                       !(ir_[end].op == IR::Label && !ir_[end].x.empty() && ir_[end].x[0] != '.'))
+                    ++end;
+
+                std::unordered_map<std::string, size_t> labels;
+                std::unordered_map<std::string, int> definitions;
+                for (size_t i = begin; i < end; ++i) {
+                    const auto &ins = ir_[i];
+                    if (ins.op == IR::Label)
+                        labels[ins.x] = i;
+                    const bool defines = ins.op == IR::Mov || ins.op == IR::Bin ||
+                                         ins.op == IR::Load || ins.op == IR::Call ||
+                                         (ins.op == IR::Store && isVirtual(ins.x));
+                    if (defines && isVirtual(ins.x))
+                        ++definitions[ins.x];
+                }
+
+                std::unordered_map<size_t, size_t> loopTails;
+                for (size_t i = begin; i < end; ++i) {
+                    const auto &ins = ir_[i];
+                    const std::string *target = ins.op == IR::Jump  ? &ins.x
+                                                : ins.op == IR::BrZ ? &ins.y
+                                                                    : nullptr;
+                    if (!target)
+                        continue;
+                    auto found = labels.find(*target);
+                    if (found != labels.end() && found->second <= i)
+                        loopTails[found->second] = std::max(loopTails[found->second], i);
+                }
+                std::vector<std::pair<size_t, size_t>> loops(loopTails.begin(), loopTails.end());
+                std::sort(loops.begin(), loops.end(), [](const auto &left, const auto &right) {
+                    return left.second - left.first < right.second - right.first;
+                });
+
+                for (const auto &[header, tail] : loops) {
+                    std::unordered_set<std::string> definedInside;
+                    for (size_t i = header; i <= tail; ++i) {
+                        const auto &ins = ir_[i];
+                        const bool defines = ins.op == IR::Mov || ins.op == IR::Bin ||
+                                             ins.op == IR::Load || ins.op == IR::Call ||
+                                             (ins.op == IR::Store && isVirtual(ins.x));
+                        if (defines && isVirtual(ins.x))
+                            definedInside.insert(ins.x);
+                    }
+
+                    std::unordered_set<std::string> invariant;
+                    std::vector<size_t> candidates;
+                    auto operandInvariant = [&](const std::string &value) {
+                        return !isVirtual(value) || !definedInside.contains(value) ||
+                               invariant.contains(value);
+                    };
+                    for (size_t i = header + 1; i <= tail; ++i) {
+                        const auto &ins = ir_[i];
+                        if (ins.op == IR::Bin && !ins.x.empty() && ins.x[0] == 't' &&
+                            definitions[ins.x] == 1 && operandInvariant(ins.y) &&
+                            operandInvariant(ins.z)) {
+                            invariant.insert(ins.x);
+                            candidates.push_back(i);
+                        }
+                    }
+                    if (candidates.empty())
+                        continue;
+
+                    std::unordered_set<size_t> selected(candidates.begin(), candidates.end());
+                    std::vector<IR> rewritten;
+                    rewritten.reserve(ir_.size());
+                    for (size_t i = 0; i < ir_.size(); ++i) {
+                        if (i == header)
+                            for (size_t candidate : candidates)
+                                rewritten.push_back(std::move(ir_[candidate]));
+                        if (!selected.contains(i))
+                            rewritten.push_back(std::move(ir_[i]));
+                    }
+                    ir_ = std::move(rewritten);
+                    changed = true;
+                    break;
+                }
+                begin = end;
+            }
+        }
+    }
+
     // 把常量条件分支转换为确定跳转，并按函数 CFG 删除不可达指令。
     void simplifyControlFlow() {
         const auto constants = immediateConstants(ir_);
@@ -197,6 +406,36 @@ class Generator {
         std::vector<IR> result;
         for (size_t i = 0; i < ir_.size(); ++i) {
             IR ins = std::move(ir_[i]);
+            if (ins.op == IR::Mov && !ins.y.empty() && !ins.x.empty() && ins.x[0] == 't' &&
+                definitions[ins.x] == 1 && uses[ins.x] == 1 && i + 1 < ir_.size()) {
+                IR next = ir_[i + 1];
+                bool replaced = false;
+                auto replace = [&](std::string &value) {
+                    if (value == ins.x) {
+                        value = ins.y;
+                        replaced = true;
+                    }
+                };
+                if (next.op == IR::Mov)
+                    replace(next.y);
+                else if (next.op == IR::Bin) {
+                    replace(next.y);
+                    replace(next.z);
+                } else if (next.op == IR::Load || next.op == IR::Store)
+                    replace(next.y);
+                else if (next.op == IR::Call) {
+                    auto args = callArgs(next.y);
+                    for (auto &arg : args)
+                        replace(arg);
+                    next.y = joinArgs(args);
+                } else if (next.op == IR::BrZ)
+                    replace(next.x);
+                if (replaced) {
+                    result.push_back(std::move(next));
+                    ++i;
+                    continue;
+                }
+            }
             const bool definesValue =
                 ins.op == IR::Mov || ins.op == IR::Bin || ins.op == IR::Load || ins.op == IR::Call;
             if (definesValue && !ins.x.empty() && ins.x[0] == 't' && definitions[ins.x] == 1 &&
@@ -764,95 +1003,242 @@ class Generator {
     std::unordered_map<std::string, std::string>
     allocateRegisters(const std::vector<IR> &code,
                       const std::unordered_map<std::string, int> &constants) const {
-        struct Interval {
-            std::string value;
-            int begin;
-            int end;
-        };
-        std::unordered_map<std::string, std::pair<int, int>> ranges;
-        std::unordered_map<std::string, std::string> incomingRegisters;
-        auto touch = [&](const std::string &value, int position) {
-            if (!isVirtual(value) || constants.contains(value))
-                return;
-            auto [it, inserted] = ranges.emplace(value, std::pair{position, position});
-            if (!inserted)
-                it->second.second = position;
-        };
-        for (int position = 0; position < static_cast<int>(code.size()); ++position) {
-            const auto &ins = code[position];
-            if (ins.op == IR::Mov) {
-                touch(ins.x, position);
-                touch(ins.y, position);
-                if (isVirtual(ins.x) && ins.y.size() == 2 && ins.y[0] == 'a' && ins.y[1] >= '0' &&
-                    ins.y[1] <= '7')
-                    incomingRegisters[ins.x] = ins.y;
-            } else if (ins.op == IR::Bin) {
-                touch(ins.x, position);
-                touch(ins.y, position);
-                touch(ins.z, position);
-            } else if (ins.op == IR::Load)
-                touch(ins.x, position);
-            else if (ins.op == IR::Store || ins.op == IR::BrZ)
-                touch(ins.op == IR::Store ? ins.y : ins.x, position);
-            else if (ins.op == IR::Call) {
-                touch(ins.x, position);
-                for (const auto &arg : callArgs(ins.y))
-                    touch(arg, position);
-            }
-        }
-
-        std::vector<Interval> intervals;
-        for (const auto &[value, range] : ranges)
-            intervals.push_back({value, range.first, range.second});
-        std::sort(intervals.begin(), intervals.end(),
-                  [](const auto &a, const auto &b) { return a.begin < b.begin; });
-
         const std::array<std::string, 11> temporaries = {"t4", "t5", "t6", "a0", "a1", "a2",
                                                          "a3", "a4", "a5", "a6", "a7"};
         const std::array<std::string, 11> saved = {"s1", "s2", "s3", "s4",  "s5", "s6",
                                                    "s7", "s8", "s9", "s10", "s11"};
-        struct Active {
-            int end;
-            std::string reg;
+        const size_t count = code.size();
+        std::unordered_map<std::string, size_t> labels;
+        for (size_t i = 0; i < count; ++i)
+            if (code[i].op == IR::Label)
+                labels[code[i].x] = i;
+
+        std::vector<std::unordered_set<std::string>> uses(count), defs(count), liveIn(count),
+            liveOut(count);
+        std::unordered_set<std::string> values;
+        std::unordered_map<std::string, long long> spillWeight;
+        std::unordered_map<std::string, std::string> incomingRegisters;
+        std::vector<int> loopDepth(count);
+        for (size_t i = 0; i < count; ++i) {
+            auto markLoop = [&](const std::string &target) {
+                if (auto found = labels.find(target); found != labels.end() && found->second <= i)
+                    for (size_t position = found->second; position <= i; ++position)
+                        ++loopDepth[position];
+            };
+            if (code[i].op == IR::Jump)
+                markLoop(code[i].x);
+            else if (code[i].op == IR::BrZ)
+                markLoop(code[i].y);
+        }
+
+        // 只让循环内原本需要 li 的常量参与分配；可直接编码为立即数的常量仍按使用点折叠。
+        std::unordered_map<std::string, long long> constantBenefit;
+        std::unordered_map<std::string, int> useCount;
+        auto countValue = [&](const std::string &value) {
+            if (isVirtual(value))
+                ++useCount[value];
         };
-        std::vector<Active> active;
-        std::unordered_set<std::string> free;
-        free.insert(temporaries.begin(), temporaries.end());
-        free.insert(saved.begin(), saved.end());
-        std::unordered_map<std::string, std::string> allocation;
-        const auto liveAcrossCalls = valuesLiveAcrossCalls(code);
-        for (const auto &interval : intervals) {
-            for (auto it = active.begin(); it != active.end();) {
-                if (it->end < interval.begin) {
-                    free.insert(it->reg);
-                    it = active.erase(it);
-                } else
-                    ++it;
-            }
-            const bool crossesCall = liveAcrossCalls.contains(interval.value);
-            std::string reg;
-            if (!crossesCall) {
-                if (auto incoming = incomingRegisters.find(interval.value);
-                    incoming != incomingRegisters.end() && free.contains(incoming->second))
-                    reg = incoming->second;
-            }
-            if (!crossesCall && reg.empty())
-                for (const auto &candidate : temporaries)
-                    if (free.contains(candidate)) {
-                        reg = candidate;
-                        break;
-                    }
-            if (reg.empty())
-                for (const auto &candidate : saved)
-                    if (free.contains(candidate)) {
-                        reg = candidate;
-                        break;
-                    }
-            if (reg.empty())
+        for (const auto &ins : code) {
+            if (ins.op == IR::Mov)
+                countValue(ins.y);
+            else if (ins.op == IR::Bin) {
+                countValue(ins.y);
+                countValue(ins.z);
+            } else if (ins.op == IR::Load || ins.op == IR::Store)
+                countValue(ins.y);
+            else if (ins.op == IR::Call)
+                for (const auto &arg : callArgs(ins.y))
+                    countValue(arg);
+            else if (ins.op == IR::BrZ)
+                countValue(ins.x);
+        }
+        auto magnitude = [](int value) {
+            return value < 0 ? 0U - static_cast<std::uint32_t>(value)
+                             : static_cast<std::uint32_t>(value);
+        };
+        for (size_t i = 0; i < count; ++i) {
+            const auto &ins = code[i];
+            if (loopDepth[i] == 0 || ins.op != IR::Bin)
                 continue;
-            free.erase(reg);
-            allocation[interval.value] = reg;
-            active.push_back({interval.end, reg});
+            const bool fused = i + 1 < count && code[i + 1].op == IR::BrZ &&
+                               code[i + 1].x == ins.x && useCount[ins.x] == 1;
+            auto needsRegister = [&](const std::string &value, bool left) {
+                auto found = constants.find(value);
+                if (found == constants.end() || found->second == 0)
+                    return false;
+                const int immediate = found->second;
+                if (fused && (ins.aux == "<" || ins.aux == ">" || ins.aux == "<=" ||
+                              ins.aux == ">=" || ins.aux == "==" || ins.aux == "!="))
+                    return true;
+                if (ins.aux == "+")
+                    return immediate < -2048 || immediate > 2047;
+                if (ins.aux == "-" && !left)
+                    return immediate < -2047 || immediate > 2048;
+                if ((ins.aux == "==" || ins.aux == "!=") &&
+                    ((constants.contains(ins.y) && constants.at(ins.y) == 0) ||
+                     (constants.contains(ins.z) && constants.at(ins.z) == 0)))
+                    return false;
+                if (ins.aux == "<" && !left && immediate >= -2048 && immediate <= 2047)
+                    return false;
+                if (ins.aux == "*") {
+                    const auto absolute = magnitude(immediate);
+                    const bool powerOfTwo = absolute && (absolute & (absolute - 1)) == 0;
+                    return !powerOfTwo && absolute != 3 && absolute != 5 && absolute != 7 &&
+                           absolute != 9;
+                }
+                if ((ins.aux == "/" || ins.aux == "%") && !left) {
+                    const auto absolute = magnitude(immediate);
+                    if (absolute > 1 && (absolute & (absolute - 1)) == 0)
+                        return false;
+                }
+                return true;
+            };
+            if (needsRegister(ins.y, true))
+                constantBenefit[ins.y] += 1LL << std::min(loopDepth[i], 12);
+            if (needsRegister(ins.z, false))
+                constantBenefit[ins.z] += 1LL << std::min(loopDepth[i], 12);
+        }
+        std::unordered_set<std::string> registerConstants;
+        for (const auto &[value, benefit] : constantBenefit)
+            if (benefit > 1)
+                registerConstants.insert(value);
+
+        auto recordUse = [&](size_t i, const std::string &value) {
+            if (!isVirtual(value) ||
+                (constants.contains(value) && !registerConstants.contains(value)))
+                return;
+            uses[i].insert(value);
+            values.insert(value);
+            spillWeight[value] += 1LL << std::min(loopDepth[i], 12);
+        };
+        auto recordDef = [&](size_t i, const std::string &value) {
+            if (!isVirtual(value) ||
+                (constants.contains(value) && !registerConstants.contains(value)))
+                return;
+            defs[i].insert(value);
+            values.insert(value);
+            spillWeight[value] += 1LL << std::min(loopDepth[i], 12);
+        };
+        for (size_t i = 0; i < count; ++i) {
+            const auto &ins = code[i];
+            if (ins.op == IR::Mov) {
+                recordDef(i, ins.x);
+                recordUse(i, ins.y);
+                if (isVirtual(ins.x) && ins.y.size() == 2 && ins.y[0] == 'a' && ins.y[1] >= '0' &&
+                    ins.y[1] <= '7')
+                    incomingRegisters[ins.x] = ins.y;
+            } else if (ins.op == IR::Bin) {
+                recordDef(i, ins.x);
+                recordUse(i, ins.y);
+                recordUse(i, ins.z);
+            } else if (ins.op == IR::Load) {
+                recordDef(i, ins.x);
+                recordUse(i, ins.y);
+            } else if (ins.op == IR::Store) {
+                recordDef(i, ins.x);
+                recordUse(i, ins.y);
+            } else if (ins.op == IR::Call) {
+                recordDef(i, ins.x);
+                for (const auto &arg : callArgs(ins.y))
+                    recordUse(i, arg);
+            } else if (ins.op == IR::BrZ) {
+                recordUse(i, ins.x);
+            }
+        }
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t reverse = count; reverse-- > 0;) {
+                std::unordered_set<std::string> out;
+                auto merge = [&](size_t successor) {
+                    if (successor < count)
+                        out.insert(liveIn[successor].begin(), liveIn[successor].end());
+                };
+                const auto &ins = code[reverse];
+                if (ins.op == IR::Jump) {
+                    if (auto target = labels.find(ins.x); target != labels.end())
+                        merge(target->second);
+                } else if (ins.op == IR::BrZ) {
+                    if (auto target = labels.find(ins.y); target != labels.end())
+                        merge(target->second);
+                    merge(reverse + 1);
+                } else if (ins.op != IR::Ret) {
+                    merge(reverse + 1);
+                }
+                auto in = uses[reverse];
+                for (const auto &value : out)
+                    if (!defs[reverse].contains(value))
+                        in.insert(value);
+                if (out != liveOut[reverse] || in != liveIn[reverse]) {
+                    liveOut[reverse] = std::move(out);
+                    liveIn[reverse] = std::move(in);
+                    changed = true;
+                }
+            }
+        }
+
+        // 冲突图按真实 CFG 活跃集合建立，避免线性首末区间把循环中的空洞误判为长期占用。
+        std::unordered_map<std::string, std::unordered_set<std::string>> interference;
+        auto addClique = [&](const std::unordered_set<std::string> &valuesAtInstruction) {
+            for (const auto &left : valuesAtInstruction)
+                for (const auto &right : valuesAtInstruction)
+                    if (left != right)
+                        interference[left].insert(right);
+        };
+        for (size_t i = 0; i < count; ++i) {
+            // 同一指令的多个源操作数必须同时可读；其余冲突由标准 def-liveOut 关系给出。
+            addClique(uses[i]);
+            for (const auto &defined : defs[i])
+                for (const auto &live : liveOut[i])
+                    if (defined != live) {
+                        interference[defined].insert(live);
+                        interference[live].insert(defined);
+                    }
+        }
+
+        const auto liveAcrossCalls = valuesLiveAcrossCalls(code);
+        std::vector<std::string> order(values.begin(), values.end());
+        auto degree = [&](const std::string &value) {
+            auto found = interference.find(value);
+            return found == interference.end() ? size_t{0} : found->second.size();
+        };
+        std::sort(order.begin(), order.end(), [&](const auto &left, const auto &right) {
+            const auto leftScore = spillWeight[left] * static_cast<long long>(degree(left) + 1);
+            const auto rightScore = spillWeight[right] * static_cast<long long>(degree(right) + 1);
+            if (leftScore != rightScore)
+                return leftScore > rightScore;
+            if (degree(left) != degree(right))
+                return degree(left) > degree(right);
+            return left < right;
+        });
+
+        std::unordered_map<std::string, std::string> allocation;
+        // 形参入口拷贝按顺序发射；预着色到原 ABI 寄存器可防止提前覆盖尚未保存的后续实参。
+        for (const auto &[value, reg] : incomingRegisters)
+            if (!liveAcrossCalls.contains(value))
+                allocation[value] = reg;
+        for (const auto &value : order) {
+            if (allocation.contains(value))
+                continue;
+            std::unordered_set<std::string> unavailable;
+            if (auto neighbors = interference.find(value); neighbors != interference.end())
+                for (const auto &neighbor : neighbors->second)
+                    if (auto found = allocation.find(neighbor); found != allocation.end())
+                        unavailable.insert(found->second);
+            auto choose = [&](const auto &candidates) {
+                for (const auto &candidate : candidates)
+                    if (!unavailable.contains(candidate))
+                        return candidate;
+                return std::string{};
+            };
+            std::string reg;
+            if (!liveAcrossCalls.contains(value))
+                reg = choose(temporaries);
+            if (reg.empty())
+                reg = choose(saved);
+            if (!reg.empty())
+                allocation[value] = std::move(reg);
         }
         return allocation;
     }
@@ -1148,12 +1534,16 @@ class Generator {
             scopes_.pop_back();
         }
         if (opt_) {
+            promoteGlobals();
             promoteLocalSlots();
             eliminateCommonSubexpressions();
             simplifyIR();
             simplifyControlFlow();
             propagateConstants();
             simplifyControlFlow();
+            eliminateCommonSubexpressions();
+            simplifyIR();
+            hoistLoopInvariants();
             eliminateCommonSubexpressions();
             simplifyIR();
             eliminateDeadDefinitions();
@@ -1250,13 +1640,15 @@ class Generator {
                     return std::string(scratch);
                 if (value == "0")
                     return std::string("zero");
+                if (auto found = allocation.find(value); found != allocation.end())
+                    return found->second;
                 if (auto imm = constant(value)) {
+                    if (*imm == 0)
+                        return std::string("zero");
                     o << "  li " << scratch << ", " << *imm << "\n";
                     return std::string(scratch);
                 }
                 if (isVirtual(value)) {
-                    if (auto found = allocation.find(value); found != allocation.end())
-                        return found->second;
                     stackMemory("lw", scratch, slot[value] * 4);
                     return std::string(scratch);
                 }
@@ -1351,7 +1743,7 @@ class Generator {
                     }
                     break;
                 case IR::Mov: {
-                    if (ins.y.empty() && constants.contains(ins.x))
+                    if (ins.y.empty() && constants.contains(ins.x) && !allocation.contains(ins.x))
                         break;
                     const std::string target = destination(ins.x, "t0");
                     if (ins.y.empty())
@@ -1501,12 +1893,11 @@ class Generator {
                     std::vector<DeferredArgument> deferred;
                     for (size_t k = 0; k < std::min<size_t>(8, args.size()); ++k) {
                         const std::string target = "a" + std::to_string(k);
-                        if (constant(args[k])) {
-                            deferred.push_back({target, args[k]});
-                        } else if (auto found = allocation.find(args[k]);
-                                   found != allocation.end()) {
+                        if (auto found = allocation.find(args[k]); found != allocation.end()) {
                             if (found->second != target)
                                 moves.push_back({target, found->second});
+                        } else if (constant(args[k])) {
+                            deferred.push_back({target, args[k]});
                         } else if (isVirtual(args[k])) {
                             deferred.push_back({target, args[k]});
                         } else if (args[k] != target) {

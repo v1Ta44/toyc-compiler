@@ -16,8 +16,8 @@ factorial:
   addi t4, s1, -1
   mv a0, t4
   call factorial
-  mv t5, a0
-  mul a0, s1, t5
+  mv t4, a0
+  mul a0, s1, t4
   lw s1, 8(sp)
   lw ra, 12(sp)
   addi sp, sp, 16

@@ -172,8 +172,7 @@ mark:
 main:
   addi sp, sp, -64
   sw ra, 60(sp)
-  li t0, 0
-  sw t0, 0(sp)
+  sw zero, 0(sp)
 .L61:
   lw t1, 0(sp)
   mv t0, t1

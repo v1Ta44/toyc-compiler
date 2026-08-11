@@ -6,10 +6,8 @@ global:
 .globl main
 main:
   addi sp, sp, -80
-  li t0, 0
-  sw t0, 0(sp)
-  li t0, 0
-  sw t0, 4(sp)
+  sw zero, 0(sp)
+  sw zero, 4(sp)
 .L4:
   lw t1, 4(sp)
   mv t0, t1
@@ -101,8 +99,7 @@ main:
   beqz t0, .L37
   j .L36
 .L37:
-  li t2, 0
-  snez t0, t2
+  snez t0, zero
   sw t0, 76(sp)
 .L36:
   lw t1, 76(sp)

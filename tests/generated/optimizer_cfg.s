@@ -27,8 +27,7 @@ choose:
 main:
   addi sp, sp, -128
   sw ra, 124(sp)
-  li t0, 0
-  sw t0, 0(sp)
+  sw zero, 0(sp)
   li t0, 1
   sw t0, 4(sp)
 .L13:
@@ -68,8 +67,7 @@ main:
   sw t0, 40(sp)
   li t0, -4
   sw t0, 44(sp)
-  li t0, 0
-  sw t0, 48(sp)
+  sw zero, 48(sp)
   lw t1, 48(sp)
   mv t0, t1
   sw t0, 52(sp)
